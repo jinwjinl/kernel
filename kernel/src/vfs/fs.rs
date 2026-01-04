@@ -20,7 +20,8 @@ use alloc::sync::Arc;
 use core::{any::Any, fmt::Debug};
 
 /// File system information, used for statfs
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Copy, Default)]
+#[allow(clippy::clone_on_copy)]
 pub struct FileSystemInfo {
     pub magic: usize,
     pub dev: usize,

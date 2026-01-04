@@ -17,7 +17,7 @@ use crate::{
     error::Error,
     thread::{Thread, ThreadNode},
 };
-use alloc::{format, string::String, vec::Vec};
+use alloc::{string::String, vec::Vec};
 use core::fmt::Write;
 
 pub struct ProcTaskFile {
@@ -30,14 +30,22 @@ impl ProcTaskFile {
     }
 }
 
+// Reduce write! times.
 impl ProcFileOps for ProcTaskFile {
     fn get_content(&self) -> Result<Vec<u8>, Error> {
-        let mut result = String::with_capacity(64);
-        writeln!(result, "{:<9} {}", "Name:", self.thread.kind_to_str()).unwrap();
-        writeln!(result, "{:<9} {}", "State:", self.thread.state_to_str()).unwrap();
-        writeln!(result, "{:<9} {}", "Tid:", Thread::id(&self.thread)).unwrap();
-        writeln!(result, "{:<9} {}", "Priority:", self.thread.priority()).unwrap();
-        Ok(result.as_bytes().to_vec())
+        let mut result = String::with_capacity(128);
+
+        write!(
+            result,
+            "Name:     {}\nState:    {}\nTid:      {}\nPriority: {}\n",
+            self.thread.kind_to_str(),
+            self.thread.state_to_str(),
+            Thread::id(&self.thread),
+            self.thread.priority()
+        )
+        .unwrap();
+
+        Ok(result.into_bytes())
     }
 
     fn set_content(&self, content: Vec<u8>) -> Result<usize, Error> {

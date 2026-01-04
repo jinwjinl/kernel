@@ -176,7 +176,7 @@ impl FileSystem for ProcFileSystem {
         self.root.clone()
     }
     fn fs_info(&self) -> FileSystemInfo {
-        self.fs_info.clone()
+        self.fs_info
     }
     fn fs_type(&self) -> &str {
         "procfs"

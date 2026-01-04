@@ -71,7 +71,7 @@ pub fn socket(domain: c_int, type_: c_int, protocol_: c_int) -> c_int {
         return -1;
     }
     if let Err(e) = sock_attach_to_fd(socket, Arc::new(connection)) {
-        log::error!("sock_attach_to_fd socket fd={} error: {}", socket, e);
+        log::error!("sock_attach_to_fd socket fd={} error: {:?}", socket, e);
         -1
     } else {
         socket

@@ -113,7 +113,10 @@ extern "C" fn init() {
     DeviceManager::get().register_device(String::from("ttyS0"), get_serial(0).clone());
     match console::init_console(Tty::init(get_serial(0).clone()).clone()) {
         Ok(_) => {}
-        Err(err) => panic!("Failed to init console: {}", crate::error::Error::from(err)),
+        Err(err) => panic!(
+            "Failed to init console: {:?}",
+            crate::error::Error::from(err)
+        ),
     }
 
     #[cfg(virtio)]
@@ -156,7 +159,7 @@ pub(crate) fn init_vfs() {
             return;
         }
         if let Err(err) = vfs::vfs_init() {
-            panic!("{}", err);
+            panic!("{:?}", err);
         };
         INIT_VFS_DONE = true;
     }

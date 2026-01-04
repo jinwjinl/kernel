@@ -46,7 +46,7 @@ pub enum ConnectionError {
     #[error("Port {0} is invalid : {1}")]
     PortOutOfRange(u16, String),
 
-    #[error("Posix error : {0}")]
+    #[error("Posix error : {0:?}")]
     PosixError(Error),
 
     #[error("Socket opertion error : {0}")]

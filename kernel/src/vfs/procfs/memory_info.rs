@@ -21,20 +21,54 @@ pub(crate) struct MemoryInfo;
 impl ProcFileOps for MemoryInfo {
     fn get_content(&self) -> Result<Vec<u8>, Error> {
         let meminfo = allocator::memory_info();
-        let available = meminfo.total - meminfo.used;
-        // Pre-allocate buffer with estimated size
+        let total = meminfo.total / 1024;
+        let available = (meminfo.total - meminfo.used) / 1024;
+        let used = meminfo.used / 1024;
+        let max_used = meminfo.max_used / 1024;
         let mut result = String::with_capacity(128);
-        writeln!(result, "{:<14}{:>8} kB", "MemTotal:", meminfo.total / 1024).unwrap();
-        writeln!(result, "{:<14}{:>8} kB", "MemAvailable:", available / 1024).unwrap();
-        writeln!(result, "{:<14}{:>8} kB", "MemUsed:", meminfo.used / 1024).unwrap();
-        writeln!(
-            result,
-            "{:<14}{:>8} kB",
-            "MemMaxUsed:",
-            meminfo.max_used / 1024
-        )
-        .unwrap();
-        Ok(result.as_bytes().to_vec())
+
+        let mut write_line = |label: &str, value: usize, width: usize| {
+            let _ = write!(result, "{:<14}", label);
+            let mut n = value;
+            let mut len = 1;
+            while n >= 10 {
+                n /= 10;
+                len += 1;
+            }
+
+            if width > len {
+                for _ in 0..(width - len) {
+                    let _ = result.write_char(' ');
+                }
+            }
+
+            let _ = writeln!(result, "{} kB", value);
+        };
+        let mut write_aligned = |label_with_padding: &str, value: usize| {
+            let _ = result.write_str(label_with_padding);
+            let mut n = value;
+            let mut len = 1;
+
+            while n >= 10 {
+                n /= 10;
+                len += 1;
+            }
+
+            const TARGET_WIDTH: usize = 8;
+            if TARGET_WIDTH > len {
+                for _ in 0..(TARGET_WIDTH - len) {
+                    let _ = result.write_char(' ');
+                }
+            }
+
+            let _ = writeln!(result, "{} kB", value);
+        };
+
+        write_aligned("MemTotal:     ", total);
+        write_aligned("MemAvailable: ", available);
+        write_aligned("MemUsed:      ", used);
+        write_aligned("MemMaxUsed:   ", max_used);
+        Ok(result.into_bytes())
     }
 
     fn set_content(&self, content: Vec<u8>) -> Result<usize, Error> {

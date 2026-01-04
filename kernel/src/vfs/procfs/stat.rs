@@ -19,30 +19,30 @@ use crate::{
     scheduler, thread, time,
 };
 use alloc::{string::String, vec::Vec};
-use core::{
-    fmt::{self, Write},
-    sync::atomic::Ordering::Relaxed,
-};
+use core::{fmt::Write, sync::atomic::Ordering::Relaxed};
 
 pub(crate) struct SystemStat;
 
 const NUM_CORES: usize = blueos_kconfig::CONFIG_NUM_CORES as usize;
 
+// Change: using one string to recieve and delete Display.
 impl ProcFileOps for SystemStat {
     fn get_content(&self) -> Result<Vec<u8>, Error> {
-        let cpu_time_str = format_cpu_time();
-        let irq_counts_str = format_irq_counts();
-        let mut result = String::with_capacity(cpu_time_str.len() + irq_counts_str.len() + 1);
-        write!(result, "{}\n{}", cpu_time_str, irq_counts_str).unwrap();
-        Ok(result.as_bytes().to_vec())
-    }
+        // CPU part: ~100 bytes per line * (total + every cpu core)
+        // IRQ part: ~16 bytes per counter (conservative estimate)
+        let capacity = 100 * (NUM_CORES + 1) + IRQ_COUNTERS.len() * 16;
+        let mut result = String::with_capacity(capacity);
+        append_cpu_time(&mut result);
 
-    fn set_content(&self, content: Vec<u8>) -> Result<usize, Error> {
+        result.push('\n');
+        append_irq_counts(&mut result);
+        Ok(result.into_bytes())
+    }
+    fn set_content(&self, _content: Vec<u8>) -> Result<usize, Error> {
         Ok(0)
     }
 }
-
-#[derive(Default, Debug, Copy, Clone)]
+#[derive(Default, Copy, Clone)]
 struct CpuStat {
     cpu_id: usize,
     user: u64,
@@ -57,56 +57,16 @@ struct CpuStat {
     guest_nice: u64,
 }
 
-impl fmt::Display for CpuStat {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.cpu_id == NUM_CORES {
-            write!(
-                f,
-                "cpu {} {} {} {} {} {} {} {} {} {}\r\n",
-                self.user,
-                self.nice,
-                self.system,
-                self.idle,
-                self.iowait,
-                self.irq,
-                self.softirq,
-                self.steal,
-                self.guest,
-                self.guest_nice
-            )
-        } else {
-            write!(
-                f,
-                "cpu{}  {} {} {} {} {} {} {} {} {} {}\r\n",
-                self.cpu_id,
-                self.user,
-                self.nice,
-                self.system,
-                self.idle,
-                self.iowait,
-                self.irq,
-                self.softirq,
-                self.steal,
-                self.guest,
-                self.guest_nice
-            )
-        }
-    }
-}
-
-fn format_cpu_time() -> String {
-    let mut result = String::with_capacity(100 * (NUM_CORES + 1)); // total + every cpu core
+fn append_cpu_time(result: &mut String) {
     let mut total_system_time: u64 = 0;
     let mut total_idle_time: u64 = 0;
     let mut total_irq_time: u64 = 0;
-
     let mut cpu_stats = [CpuStat::default(); NUM_CORES + 1];
     loop {
         let pg = thread::Thread::try_preempt_me();
         if !pg.preemptable() {
             continue;
         }
-
         let total_cycle: u64 = time::get_sys_cycles();
         for cpu_id in 0..NUM_CORES {
             let idle_thread = scheduler::get_idle_thread(cpu_id);
@@ -122,47 +82,72 @@ fn format_cpu_time() -> String {
             total_system_time += system_time;
             total_idle_time += idle_time;
             total_irq_time += irq_time;
-            cpu_stats[cpu_id + 1].cpu_id = cpu_id;
-            cpu_stats[cpu_id + 1].system = system_time;
-            cpu_stats[cpu_id + 1].idle = idle_time;
-            cpu_stats[cpu_id + 1].irq = irq_time;
-        }
-        cpu_stats[0].cpu_id = NUM_CORES; // total
-        cpu_stats[0].system = total_system_time;
-        cpu_stats[0].idle = total_idle_time;
-        cpu_stats[0].irq = total_irq_time;
 
+            let stat = &mut cpu_stats[cpu_id + 1];
+            stat.cpu_id = cpu_id;
+            stat.system = system_time;
+            stat.idle = idle_time;
+            stat.irq = irq_time;
+        }
+        let total_stat = &mut cpu_stats[0];
+        total_stat.cpu_id = NUM_CORES; // total
+        total_stat.system = total_system_time;
+        total_stat.idle = total_idle_time;
+        total_stat.irq = total_irq_time;
         break;
     }
 
-    for cpu_stat in &cpu_stats {
-        write!(result, "{}", cpu_stat).unwrap();
+    for stat in &cpu_stats {
+        if stat.cpu_id == NUM_CORES {
+            writeln!(
+                result,
+                "cpu  {} {} {} {} {} {} {} {} {} {}",
+                stat.user,
+                stat.nice,
+                stat.system,
+                stat.idle,
+                stat.iowait,
+                stat.irq,
+                stat.softirq,
+                stat.steal,
+                stat.guest,
+                stat.guest_nice
+            )
+            .unwrap();
+        } else {
+            writeln!(
+                result,
+                "cpu{} {} {} {} {} {} {} {} {} {} {}",
+                stat.cpu_id,
+                stat.user,
+                stat.nice,
+                stat.system,
+                stat.idle,
+                stat.iowait,
+                stat.irq,
+                stat.softirq,
+                stat.steal,
+                stat.guest,
+                stat.guest_nice
+            )
+            .unwrap();
+        }
     }
-    result
 }
 
-fn format_irq_counts() -> String {
+fn append_irq_counts(result: &mut String) {
     let mut total_count: u64 = 0;
-    let mut non_zero_count: usize = 0;
+
     for atomic in &IRQ_COUNTERS {
         let count = atomic.load(Relaxed) as u64;
         total_count = total_count.saturating_add(count);
-        if count > 0 {
-            non_zero_count += 1;
-        }
     }
+
     const PREFIX: &str = "intr ";
-    const U32_MAX_DIGITS: usize = 10;
-    const LEN_PER_NON_ZERO_ELEMENT: usize = 1 + U32_MAX_DIGITS; // space + non-zero number
-    const LEN_PER_ZERO_ELEMENT: usize = 2; // space + number 0
-    let capacity = PREFIX.len()
-        + LEN_PER_NON_ZERO_ELEMENT * non_zero_count
-        + LEN_PER_ZERO_ELEMENT * (IRQ_COUNTERS.len() - non_zero_count);
-    let mut result = String::with_capacity(capacity);
     write!(result, "{} {}", PREFIX, total_count).unwrap();
+
     for element in &IRQ_COUNTERS {
         let count = element.load(Relaxed);
         write!(result, " {}", count).unwrap();
     }
-    result
 }

@@ -78,7 +78,7 @@ const EXDEV_STR: &CStr = c"Cross-device link";
 const EILSEQ_STR: &CStr = c"Invalid data";
 const ENOTSUP_STR: &CStr = c"Not supported";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(transparent)]
 pub struct Error(i32);
 static mut ERRNO: Error = Error(0);
@@ -185,10 +185,10 @@ pub fn strerror(error: i32) -> *const core::ffi::c_char {
     Error(error).name().as_ptr()
 }
 
-impl core::fmt::Display for Error {
+impl core::fmt::Debug for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Convert CStr to str, fallback to error code if conversion fails
-        let err_msg = self.name().to_str().unwrap_or("Unknown error");
-        write!(f, "Error({}): {}", self.0, err_msg)
+        let c_str = self.name();
+        let s = c_str.to_str().unwrap_or("Unknown Error");
+        f.write_str(s)
     }
 }
