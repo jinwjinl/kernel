@@ -33,19 +33,19 @@ impl ProcTaskFile {
 // Reduce write! times.
 impl ProcFileOps for ProcTaskFile {
     fn get_content(&self) -> Result<Vec<u8>, Error> {
-        let mut result = String::with_capacity(128);
+            let mut result = String::with_capacity(128);
 
-        write!(
-            result,
-            "Name:     {}\nState:    {}\nTid:      {}\nPriority: {}\n",
-            self.thread.kind_to_str(),
-            self.thread.state_to_str(),
-            Thread::id(&self.thread),
-            self.thread.priority()
-        )
-        .unwrap();
+            write!(
+                result,
+                "Name:     {}\nState:    {}\nTid:      {}\nPriority: {}\n",
+                self.thread.kind_to_str(),
+                self.thread.state_to_str(),
+                Thread::id(&self.thread),
+                self.thread.priority()
+            )
+            .unwrap();
 
-        Ok(result.into_bytes())
+            Ok(result.into_bytes())
     }
 
     fn set_content(&self, content: Vec<u8>) -> Result<usize, Error> {
