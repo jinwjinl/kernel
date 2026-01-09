@@ -102,7 +102,7 @@ pub fn vfs_init() -> Result<(), Error> {
                 debug!("Mounted fatfs at '/fat'");
             }
             Err(error) => {
-                error!("Fail to init fat file system, {}", error);
+                error!("Fail to init fat file system, {:?}", error);
                 return Err(error);
             }
         }

@@ -202,11 +202,19 @@ pub trait Device: Send + Sync {
 
 impl Debug for dyn Device {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        f.debug_struct("Device")
-            .field("name", &self.name())
-            .field("class", &self.class())
-            .field("id", &self.id())
-            .finish()
+        #[cfg(debug_assertions)]
+        {
+            f.debug_struct("Device")
+                .field("name", &self.name())
+                .field("class", &self.class())
+                .field("id", &self.id())
+                .finish()
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            f.write_str("Device")
+        }
     }
 }
 

@@ -33,6 +33,8 @@ impl ProcTaskFile {
 // Reduce write! times.
 impl ProcFileOps for ProcTaskFile {
     fn get_content(&self) -> Result<Vec<u8>, Error> {
+        #[cfg(debug_assertions)]
+        {
             let mut result = String::with_capacity(128);
 
             write!(
@@ -46,6 +48,12 @@ impl ProcFileOps for ProcTaskFile {
             .unwrap();
 
             Ok(result.into_bytes())
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            Ok("Skip in release".as_bytes().to_vec())
+        }
     }
 
     fn set_content(&self, content: Vec<u8>) -> Result<usize, Error> {

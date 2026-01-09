@@ -99,7 +99,7 @@ pub fn get_fs(fs_type: &str, device: &str) -> Option<Arc<dyn FileSystem>> {
             Ok(fs) => Some(fs),
             Err(error) => {
                 error!(
-                    "Fail to init fat file system with device {}, {}",
+                    "Fail to init fat file system with device {}, {:?}",
                     device, error
                 );
                 None

@@ -460,16 +460,23 @@ impl Dcache {
 
 impl Debug for Dcache {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Dcache {{ inode: {:p}, name: {}, fs {} }}",
-            self.inode,
-            self.get_full_path(),
-            match self.inode.fs() {
-                Some(fs) => String::from(fs.fs_type()),
-                None => String::from("unknown"),
-            },
-        )
+        #[cfg(debug_assertions)]
+        {
+            write!(
+                f,
+                "Dcache {{ inode: {:p}, name: {}, fs {} }}",
+                self.inode,
+                self.get_full_path(),
+                match self.inode.fs() {
+                    Some(fs) => String::from(fs.fs_type()),
+                    None => String::from("unknown"),
+                },
+            )
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            f.write_str("Dcache")
+        }
     }
 }
 

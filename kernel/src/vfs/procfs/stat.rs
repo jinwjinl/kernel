@@ -28,15 +28,23 @@ const NUM_CORES: usize = blueos_kconfig::CONFIG_NUM_CORES as usize;
 // Change: using one string to recieve and delete Display.
 impl ProcFileOps for SystemStat {
     fn get_content(&self) -> Result<Vec<u8>, Error> {
-        // CPU part: ~100 bytes per line * (total + every cpu core)
-        // IRQ part: ~16 bytes per counter (conservative estimate)
-        let capacity = 100 * (NUM_CORES + 1) + IRQ_COUNTERS.len() * 16;
-        let mut result = String::with_capacity(capacity);
-        append_cpu_time(&mut result);
+        #[cfg(debug_assertions)]
+        {
+            // CPU part: ~100 bytes per line * (total + every cpu core)
+            // IRQ part: ~16 bytes per counter (conservative estimate)
+            let capacity = 100 * (NUM_CORES + 1) + IRQ_COUNTERS.len() * 16;
+            let mut result = String::with_capacity(capacity);
+            append_cpu_time(&mut result);
 
-        result.push('\n');
-        append_irq_counts(&mut result);
-        Ok(result.into_bytes())
+            result.push('\n');
+            append_irq_counts(&mut result);
+            Ok(result.into_bytes())
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            Ok("Skip in release".as_bytes().to_vec())
+        }
     }
     fn set_content(&self, _content: Vec<u8>) -> Result<usize, Error> {
         Ok(0)

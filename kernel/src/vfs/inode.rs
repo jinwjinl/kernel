@@ -204,9 +204,16 @@ impl dyn InodeOps {
 
 impl Debug for dyn InodeOps {
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
-        f.debug_struct("InodeOps")
-            .field("attr", &self.inode_attr())
-            .field("fs", &self.fs())
-            .finish()
+        #[cfg(debug_assertions)]
+        {
+            f.debug_struct("InodeOps")
+                .field("attr", &self.inode_attr())
+                .field("fs", &self.fs())
+                .finish()
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            f.write_str("InodeOpsS")
+        }
     }
 }

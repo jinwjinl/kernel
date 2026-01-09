@@ -20,55 +20,63 @@ pub(crate) struct MemoryInfo;
 
 impl ProcFileOps for MemoryInfo {
     fn get_content(&self) -> Result<Vec<u8>, Error> {
-        let meminfo = allocator::memory_info();
-        let total = meminfo.total / 1024;
-        let available = (meminfo.total - meminfo.used) / 1024;
-        let used = meminfo.used / 1024;
-        let max_used = meminfo.max_used / 1024;
-        let mut result = String::with_capacity(128);
+        #[cfg(debug_assertions)]
+        {
+            let meminfo = allocator::memory_info();
+            let total = meminfo.total / 1024;
+            let available = (meminfo.total - meminfo.used) / 1024;
+            let used = meminfo.used / 1024;
+            let max_used = meminfo.max_used / 1024;
+            let mut result = String::with_capacity(128);
 
-        let mut write_line = |label: &str, value: usize, width: usize| {
-            let _ = write!(result, "{:<14}", label);
-            let mut n = value;
-            let mut len = 1;
-            while n >= 10 {
-                n /= 10;
-                len += 1;
-            }
-
-            if width > len {
-                for _ in 0..(width - len) {
-                    let _ = result.write_char(' ');
+            let mut write_line = |label: &str, value: usize, width: usize| {
+                let _ = write!(result, "{:<14}", label);
+                let mut n = value;
+                let mut len = 1;
+                while n >= 10 {
+                    n /= 10;
+                    len += 1;
                 }
-            }
 
-            let _ = writeln!(result, "{} kB", value);
-        };
-        let mut write_aligned = |label_with_padding: &str, value: usize| {
-            let _ = result.write_str(label_with_padding);
-            let mut n = value;
-            let mut len = 1;
-
-            while n >= 10 {
-                n /= 10;
-                len += 1;
-            }
-
-            const TARGET_WIDTH: usize = 8;
-            if TARGET_WIDTH > len {
-                for _ in 0..(TARGET_WIDTH - len) {
-                    let _ = result.write_char(' ');
+                if width > len {
+                    for _ in 0..(width - len) {
+                        let _ = result.write_char(' ');
+                    }
                 }
-            }
 
-            let _ = writeln!(result, "{} kB", value);
-        };
+                let _ = writeln!(result, "{} kB", value);
+            };
+            let mut write_aligned = |label_with_padding: &str, value: usize| {
+                let _ = result.write_str(label_with_padding);
+                let mut n = value;
+                let mut len = 1;
 
-        write_aligned("MemTotal:     ", total);
-        write_aligned("MemAvailable: ", available);
-        write_aligned("MemUsed:      ", used);
-        write_aligned("MemMaxUsed:   ", max_used);
-        Ok(result.into_bytes())
+                while n >= 10 {
+                    n /= 10;
+                    len += 1;
+                }
+
+                const TARGET_WIDTH: usize = 8;
+                if TARGET_WIDTH > len {
+                    for _ in 0..(TARGET_WIDTH - len) {
+                        let _ = result.write_char(' ');
+                    }
+                }
+
+                let _ = writeln!(result, "{} kB", value);
+            };
+
+            write_aligned("MemTotal:     ", total);
+            write_aligned("MemAvailable: ", available);
+            write_aligned("MemUsed:      ", used);
+            write_aligned("MemMaxUsed:   ", max_used);
+            Ok(result.into_bytes())
+        }
+
+        #[cfg(not(debug_assertions))]
+        {
+            Ok("Skip in release".as_bytes().to_vec())
+        }
     }
 
     fn set_content(&self, content: Vec<u8>) -> Result<usize, Error> {

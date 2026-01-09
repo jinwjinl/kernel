@@ -80,10 +80,15 @@ impl dyn FileSystem {
 }
 
 impl Debug for dyn FileSystem {
+    #[cfg(debug_assertions)]
     fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
         f.debug_struct("FileSystem")
             .field("fs_info", &self.fs_info())
             .field("fs_type", &self.fs_type())
             .finish()
+    }
+    #[cfg(not(debug_assertions))]
+    fn fmt(&self, f: &mut core::fmt::Formatter) -> core::fmt::Result {
+        f.write_str("FileSystem")
     }
 }
