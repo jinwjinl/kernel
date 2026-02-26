@@ -19,6 +19,7 @@ pub mod irq;
 pub(crate) mod psci;
 pub(crate) mod registers;
 pub(crate) mod vector;
+pub(crate) mod virt;
 
 use crate::{arch::registers::mpidr_el1::MPIDR_EL1, scheduler};
 use core::{

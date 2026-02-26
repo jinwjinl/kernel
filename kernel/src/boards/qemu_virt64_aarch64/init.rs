@@ -52,6 +52,11 @@ pub(crate) fn init() {
         );
     });
     STAGING.run(7, true, || arch::secondary_cpu_setup(config::PSCI_BASE));
+    //Add to init virt
+    STAGING.run(8, true, || {
+    crate::arch::aarch64::virt::virt_init();
+    });
+    
     if arch::current_cpu_id() != 0 {
         scheduler::wait_and_then_start_schedule();
         unreachable!("Secondary cores should have jumped to the scheduler");
