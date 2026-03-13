@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use core::arch::asm;
-use log::info;
-use super::hyp::read_hcr_el2;
+use crate::kprintln;
+use super::{hyp::read_hcr_el2, vgic, early_uart_print, early_uart_print_hex};
 
 /// HCR_EL2_VI: Enable virtual IRQ.
 const HCR_EL2_VI: u64 = 1 << 7;
@@ -41,6 +41,18 @@ pub struct VcpuStateStruct {
     pub pstate: u64,
     pub spsr: u64,
     pub vbar_el1: u64,
+    pub sctlr_el1:  u64,
+    pub ttbr0_el1:  u64,  
+    pub ttbr1_el1:  u64, 
+    pub tcr_el1:    u64,
+    pub mair_el1:   u64,
+    pub elr_el1:    u64,
+    pub spsr_el1:   u64,
+    pub sp_el0:     u64,
+    pub tpidr_el0:  u64,
+    pub tpidr_el1:  u64,
+    pub esr_el1:    u64,
+    pub far_el1:    u64,
 }
 
 impl VcpuStateStruct {
@@ -102,6 +114,8 @@ impl Vcpu {
         let mut context = VcpuStateStruct::new();
         context.elr_el2 = entry as u64;
         context.spsr = 0x3C5; // Default PSTATE: EL1h, DAIF masked
+        context.vbar_el1 = (entry as u64 + 0x1000) & !0x7FF;
+        context.sp = stack_top as u64;
         
         Self {
             id,
@@ -285,7 +299,7 @@ impl Vcpu {
     
     pub fn run(&mut self) {
         if self.state == VcpuState::Stopped {
-            // vgic::cpu_init(self.id);
+            vgic::cpu_init(self.id);
         }
         self.state = VcpuState::Running;
         
@@ -337,7 +351,7 @@ impl Vcpu {
                 "eret",
                 
                 sctlr = in(reg) sctlr_el1,
-                sp = in(reg) self.stack_top,
+                sp = in(reg) self.context.sp,
                 elr = in(reg) self.context.elr_el2,
                 spsr = in(reg) self.context.spsr,
                 in("x0") ctx_ptr,
@@ -398,6 +412,15 @@ impl Vcpu {
     }
 
     #[inline]
+    fn read_sp_el1() -> u64{
+        let sp_el1: u64;
+        unsafe {
+            asm!("mrs {}, sp_el1", out(reg) sp_el1, options(nostack));
+        }
+        sp_el1
+    }
+
+    #[inline]
     fn read_pstate() -> u64 {
         let pstate: u64;
         unsafe {
@@ -451,6 +474,10 @@ pub struct VcpuManager {
     vcpus: [Option<Vcpu>; 4],
     count: usize,
     current_vcpu: Option<usize>,
+    // Store host context, we change elr_el2 to make "eret" return guest.
+    pub host_elr: u64,
+    pub host_sp: u64,
+    pub host_spsr: u64,
 }
 
 impl VcpuManager {
@@ -460,6 +487,9 @@ impl VcpuManager {
             vcpus: [None, None, None, None],
             count: 0,
             current_vcpu: None,
+            host_elr: 0,
+            host_sp: 0,
+            host_spsr: 0,
         }
     }
     
@@ -493,23 +523,26 @@ impl VcpuManager {
         let vcpu = match self.vcpus[vcpu_id].as_mut() {
             Some(v) => v,
             None => {
-                info!("[VCPU] Error: vCPU {} not found", vcpu_id);
+                unsafe { early_uart_print("[VCPU] Error: vCPU not found"); }
                 return;
             }
         };
         
         if !vcpu.can_run() {
-            info!("[VCPU] Warning: vCPU {} state is {:?}, cannot run", 
-                     vcpu_id, vcpu.state());
+            unsafe { early_uart_print("[VCPU] Warning: vCPU state error."); }
             return;
         }
         
-        info!("[VCPU] Running vCPU {}", vcpu.id());
-        info!("[VCPU]   Entry: {:#018x}", vcpu.entry_point());
-        info!("[VCPU]   Stack Top: {:#018x}", vcpu.stack_top());
+        unsafe { early_uart_print_hex("[VCPU] Running vCPU :", vcpu.id().try_into().unwrap()); }
+        unsafe { early_uart_print_hex("[VCPU]   Entry: ", vcpu.entry_point().try_into().unwrap()); }
+        unsafe { early_uart_print_hex("[VCPU]   Stack Top: ", vcpu.stack_top().try_into().unwrap()); }
         
         self.current_vcpu = Some(vcpu_id);
         vcpu.run();
+    }
+
+    pub fn clear_current_vcpu(&mut self) {
+        self.current_vcpu = None;
     }
     
     #[inline]

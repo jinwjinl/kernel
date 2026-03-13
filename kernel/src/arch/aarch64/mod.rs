@@ -55,6 +55,13 @@ macro_rules! enable_interrupt {
 macro_rules! enter_el1 {
     () => {
         "
+        // Park secondary cores (CPU ID != 0)
+        mrs x0, mpidr_el1
+        and x0, x0, #0xFF
+        cbz x0, 1f
+    2:  wfi
+        b 2b
+    1:
         mrs x0, cpacr_el1
         orr x0, x0, #(0x3 << 20)
         msr cpacr_el1, x0
@@ -64,10 +71,11 @@ macro_rules! enter_el1 {
         orr     x0, x0, #3
         msr     cnthctl_el2, x0
         msr     cntvoff_el2, xzr
-        // Enable AArch64 in EL1.
-        mov x0, #(1 << 31)
-        orr x0, x0, #(1 << 1)
-        msr hcr_el2, x0
+        // Setup stack for EL2 and call virt_init
+        ldr x1, ={stack_end}
+        mov sp, x1
+        msr sp_el1, x1
+        bl {virt_init}
         // Set EL1 sp and mask daif in EL2.
         mov x0, #0x3C5
         msr spsr_el2, x0
@@ -88,6 +96,7 @@ macro_rules! arch_bootstrap {
         core::arch::naked_asm!(
             $crate::enter_el1!(),
             entry = sym $crate::arch::aarch64::init,
+            virt_init = sym $crate::arch::aarch64::virt::virt_init,
             stack_start = sym $stack_start,
             stack_end = sym $stack_end,
             cont = sym $cont,

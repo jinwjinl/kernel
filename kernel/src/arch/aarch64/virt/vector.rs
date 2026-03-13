@@ -14,58 +14,69 @@
 
 
 use core::arch::asm;
-use log::info;
-use super::{VCPU_MANAGER, vgic};
-use crate::arch::aarch64::virt::exit::handle_vm_exit;
+use super::{VCPU_MANAGER, early_uart_print, early_uart_print_hex, vgic, hyp, guest};
+use crate::arch::aarch64::virt::exit::{handle_vm_exit, is_guest_shutdown, clear_guest_shutdown};
 
 static mut PRINTED_ALIGN: bool = false;
 
 const VECTOR_TABLE_SIZE: usize = 2048;
 const SYNC_EXCEPTION_OFFSET: usize = 0x400;
 
-#[inline]
-pub fn get_vector_table_addr() -> usize {
-    hypervisor_vectors as *const () as usize
+core::arch::global_asm!(
+    "
+.section .text.hyper_vector_table
+.align 11
+.global hyper_vector_table
+hyper_vector_table:
+    // Current EL with SP0
+    .align 7
+        b sync_current_sp0
+    .align 7
+        b irq_current
+    .align 7
+        b fiq_current
+    .align 7
+        b serror_current
+
+    // Current EL with SPx
+    .align 7
+        b sync_current_spx
+    .align 7
+        b irq_current
+    .align 7
+        b fiq_current
+    .align 7
+        b serror_current
+
+    // Lower EL using AArch64
+    .align 7
+        b sync_from_lower_el1
+    .align 7
+        b irq_from_lower_el1
+    .align 7
+        b fiq_from_lower_el1
+    .align 7
+        b serror_from_lower_el1
+
+    // Lower EL using AArch32
+    .align 7
+        b sync_current_spx   // Should not happen for now
+    .align 7
+        b irq_current
+    .align 7
+        b fiq_current
+    .align 7
+        b serror_current
+"
+);
+
+extern "C" {
+    fn hyper_vector_table();
 }
 
-#[naked]
-#[no_mangle]
-#[link_section = ".text.hypervisor_vectors"]
-pub unsafe extern "C" fn hypervisor_vectors() {
-    core::arch::naked_asm!(
-        "b sync_current_sp0\n",
-        ".space 124\n",
-        "b irq_current\n",
-        ".space 124\n",
-        "b fiq_current\n",
-        ".space 124\n",
-        "b serror_current\n",
-        ".space 124\n",
-        "b sync_current_spx\n",
-        ".space 124\n",
-        "b irq_current\n",
-        ".space 124\n",
-        "b fiq_current\n",
-        ".space 124\n",
-        "b serror_current\n",
-        ".space 124\n",
-        "b sync_from_lower_el1\n",
-        ".space 124\n",
-        "b irq_from_lower_el1\n",
-        ".space 124\n",
-        "b fiq_from_lower_el1\n",
-        ".space 124\n",
-        "b serror_from_lower_el1\n",
-        ".space 124\n",
-        "b sync_current_spx\n",
-        ".space 124\n",
-        "b irq_current\n",
-        ".space 124\n",
-        "b fiq_current\n",
-        ".space 124\n",
-        "b serror_current\n",
-        ".space 124\n"
-    );
+#[inline]
+pub fn get_vector_table_addr() -> usize {
+    hyper_vector_table as *const () as usize
 }
 
 #[naked]
@@ -91,15 +102,25 @@ pub unsafe extern "C" fn sync_from_lower_el1() {
         "str x30, [sp, #240]\n",
         "mrs x1, elr_el2\n",
         "mrs x2, spsr_el2\n",
+        "mrs x3, sp_el1\n",
         "str x1, [sp, #248]\n",
         "str x2, [sp, #256]\n",
+        "str x3, [sp, #264]\n",
         "mov x0, sp\n",
         "bl sync_from_lower_el1_rust\n",
-        "cbz x0, 1f\n",
+        // x0 == 0, Guest dump.
+        "cbz x0, 3f\n",
+        // x0 == 2, Guest shutdown, return to Host.
+        "cmp x0, #2\n",
+        "b.eq 2f\n",
+        // x0 == 1, continue running Guest.
         "ldr x1, [sp, #248]\n",
         "ldr x2, [sp, #256]\n",
+        "ldr x3, [sp, #264]\n",
         "msr elr_el2, x1\n",
         "msr spsr_el2, x2\n",
+        "msr sp_el1, x3\n",
+        "isb\n",
         "ldp x0, x1, [sp, #0]\n",
         "ldp x2, x3, [sp, #16]\n",
         "ldp x4, x5, [sp, #32]\n",
@@ -118,69 +139,138 @@ pub unsafe extern "C" fn sync_from_lower_el1() {
         "ldr x30, [sp, #240]\n",
         "add sp, sp, #272\n",
         "eret\n",
-        "1:\n",
+        "2:\n",
+        "ldr x1, [sp, #248]\n",   // Host ELR
+        "ldr x2, [sp, #256]\n",   // Host SPSR
+        "ldr x3, [sp, #264]\n",   // Host SP_EL1
+        "msr elr_el2, x1\n",
+        "msr spsr_el2, x2\n",
+        "msr sp_el1, x3\n",
+        "isb\n",
+        "ldp x0, x1, [sp, #0]\n",
+        "ldp x2, x3, [sp, #16]\n",
+        "ldp x4, x5, [sp, #32]\n",
+        "ldp x6, x7, [sp, #48]\n",
+        "ldp x8, x9, [sp, #64]\n",
+        "ldp x10, x11, [sp, #80]\n",
+        "ldp x12, x13, [sp, #96]\n",
+        "ldp x14, x15, [sp, #112]\n",
+        "ldp x16, x17, [sp, #128]\n",
+        "ldp x18, x19, [sp, #144]\n",
+        "ldp x20, x21, [sp, #160]\n",
+        "ldp x22, x23, [sp, #176]\n",
+        "ldp x24, x25, [sp, #192]\n",
+        "ldp x26, x27, [sp, #208]\n",
+        "ldp x28, x29, [sp, #224]\n",
+        "ldr x30, [sp, #240]\n",
+        "add sp, sp, #272\n",
+        "eret\n",
+        "3:\n",
         "wfi\n",
-        "b 1b\n"
+        "b 3b\n"
     );
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sync_from_lower_el1_rust(frame: *mut u64) -> u64 {
+    // Hvc from guest.
     if let Some(id) = VCPU_MANAGER.0.current_vcpu_id() {
         if let Some(vcpu) = VCPU_MANAGER.0.get_vcpu(id) {
             {
                 let context = vcpu.context_mut();
-
                 for i in 0..31 {
                     context.regs[i] = *frame.add(i);
                 }
                 context.elr_el2 = *frame.add(31);
                 context.spsr = *frame.add(32);
-            }
-
-            if !PRINTED_ALIGN {
-                let addr = core::ptr::addr_of!(VCPU_MANAGER) as usize;
-                info!("[ALIGN] VCPU_MANAGER addr={:#018x} mod16={}", addr, addr & 0xF);
-                PRINTED_ALIGN = true;
+                context.sp = *frame.add(33);
             }
 
             let ok = handle_vm_exit(vcpu);
-            let original_elr = *frame.add(31);
+            if !ok && is_guest_shutdown() {
+                clear_guest_shutdown();
+                VCPU_MANAGER.0.clear_current_vcpu();
+                *frame.add(31) = VCPU_MANAGER.0.host_elr;
+                *frame.add(32) = VCPU_MANAGER.0.host_spsr;
+                *frame.add(33) = VCPU_MANAGER.0.host_sp;
+                *frame.add(0) = 0;
+                return 2;
+            }
+
             let context = vcpu.context();
             
-            // Always use the context's ELR, which should have been updated by the handler
-            let return_elr = context.elr_el2;
+            *frame.add(31) = context.elr_el2;
+            *frame.add(32) = context.spsr;
+            *frame.add(33) = context.sp;
+            for i in 0..31 {
+            *frame.add(i) = context.regs[i];
+        }
             
-            // Sanity check: Guest should not jump to Host memory
-            if (0x4000_0000..0x4800_0000).contains(&return_elr) {
-                info!("[VECTORS] CRITICAL: Guest attempting to jump to Host memory: {:#x}", return_elr);
-                info!("[VECTORS] This indicates memory corruption or stack smash.");
-            }
-
-            // DEBUG: Check for NULL return address
-            if return_elr == 0 {
-                info!("[VECTORS] CRITICAL: ELR is 0! We are about to crash.");
-                info!("[VECTORS] Original ELR from stack: {:#x}", original_elr);
-                info!("[VECTORS] Context ELR: {:#x}", context.elr_el2);
-            }
-            
-            if return_elr == original_elr {
-                info!("[VECTORS] Warning: ELR unchanged after exit! PC={:#x}", return_elr);
-            } else {
-                info!("[VECTORS] ELR updated: {:#x} -> {:#x}", original_elr, return_elr);
-            }
-
-            *frame.add(31) = return_elr;
-            *frame.add(0) = context.regs[0];
-            // *frame.add(33) = context.vbar_el1; // FIXME: VBAR not saved in asm
-            
-            // Flush VGIC LRs before re-entering Guest
             vgic::flush(id);
-
             return if ok { 1 } else { 0 };
         }
     }
 
+    // Hvc from host.
+    let esr: u64;
+    let elr: u64;
+    asm!("mrs {}, esr_el2", out(reg) esr, options(nostack));
+    asm!("mrs {}, elr_el2", out(reg) elr, options(nostack));
+    let ec = (esr >> 26) & 0x3F;
+
+    // EC = 0x16 (HVC64)
+    if ec == 0x16 {
+        // Use x0 (func_id) for dispatch instead of ISS
+        let func_id = *frame.add(0);
+        
+        match func_id {
+            0 => { 
+                early_uart_print("[EL2] VMM_INIT: Host requested init (already done in boot).");
+                core::ptr::write_volatile(frame.add(0), 0u64); // Success
+                early_uart_print_hex("[EL2] Return ELR", *frame.add(31));
+            }
+            0x01 => { // HVC #1: VCPU_INIT (Create VCPU)
+                early_uart_print("[EL2] VCPU_INIT: Creating VCPU 0...");
+                let entry = guest::guest_entry as usize;
+                let stack_top = guest::GUEST_STACK_TOP;
+                early_uart_print_hex("[EL2] VCPU_INIT: entry=", entry as u64);
+                match VCPU_MANAGER.0.create_vcpu(0, entry, stack_top) {
+                    Ok(_) => {
+                        early_uart_print("[EL2] VCPU_INIT: OK, setting x0=0");
+                        core::ptr::write_volatile(frame.add(0), 0u64);
+                    },
+                    Err(e) => {
+                        early_uart_print("[EL2] VCPU_INIT: FAILED");
+                        core::ptr::write_volatile(frame.add(0), 1u64);
+                    }
+                }
+            }
+            0x02 => { // HVC #2: VCPU_RUN (Run VCPU)
+                early_uart_print("[EL2] VCPU_RUN: Switching to Guest...");
+                // Save host return address.
+                VCPU_MANAGER.0.host_elr  = *frame.add(31);
+                VCPU_MANAGER.0.host_spsr = *frame.add(32);
+                VCPU_MANAGER.0.host_sp   = *frame.add(33);
+                early_uart_print_hex("[EL2] Host ELR saved", VCPU_MANAGER.0.host_elr);
+                
+                // CRITICAL: Enable Virtualization (VM bit) ONLY before entering Guest
+                hyp::configure_hcr_el2_for_guest();  
+                VCPU_MANAGER.0.run_vcpu(0);
+            }
+            _ => {
+                early_uart_print_hex("[EL2] Unknown Host HVC: ", func_id);
+            }
+        }        
+        return 1; // Resume
+    }
+
+    // 2. Handle FP/SIMD Trap (Allow Host to use FP)
+    // EC = 0x07 (Access to SIMD/FP)
+    if ec == 0x07 {
+        asm!("msr cptr_el2, xzr");
+        return 1; 
+    }
+    
     0
 }
 
@@ -214,7 +304,9 @@ pub unsafe extern "C" fn irq_from_lower_el1() {
         "str x1, [sp, #248]\n",
         "str x2, [sp, #256]\n",
         "mov x0, sp\n",
+        "mov x19, sp\n",
         "bl trap_irq\n",
+        "mov sp, x19\n",
         "ldr x1, [sp, #248]\n",
         "ldr x2, [sp, #256]\n",
         "msr elr_el2, x1\n",
@@ -294,14 +386,14 @@ pub unsafe extern "C" fn fiq_from_lower_el1() {
 /// Solve serror from lower el1.
 #[no_mangle]
 pub unsafe extern "C" fn serror_from_lower_el1() {
-    info!("[VECTOR] is from EL1 SError!");
+    // kprintln!("[VECTOR] is from EL1 SError!");
     asm!("eret", options(noreturn));
 }
 
 /// Solve sync exception from lower el2 sp0.
 #[no_mangle]
 pub unsafe extern "C" fn sync_current_sp0() {
-    info!("[VECTOR] is from EL2 SP0 sync exception!");
+    // kprintln!("[VECTOR] is from EL2 SP0 sync exception!");
     loop { asm!("wfi"); }
 }
 
@@ -314,14 +406,19 @@ pub unsafe extern "C" fn sync_current_spx() {
     asm!("mrs {}, elr_el2", out(reg) elr, options(nostack));
     asm!("mrs {}, far_el2", out(reg) far, options(nostack));
 
-    info!("[VECTOR] is from EL2 SPx sync exception!");
-    info!("ESR_EL2: {:#x}", esr);
-    info!("ELR_EL2: {:#x}", elr);
-    info!("FAR_EL2: {:#x}", far);
-
+    early_uart_print("[EL2] CRITICAL: Sync Exception from EL2 (SPx)!");
+    early_uart_print_hex("  ESR_EL2", esr);
+    early_uart_print_hex("  ELR_EL2", elr);
+    early_uart_print_hex("  FAR_EL2", far);
+    
+    // Attempt to decode syndrome
     let ec = (esr >> 26) & 0x3F;
-    let iss = esr & 0x1FFFFFF;
-    info!("EC: {:#x}, ISS: {:#x}", ec, iss);
+    early_uart_print_hex("  Exception Class (EC)", ec);
+    
+    // Data Abort from same EL
+    if ec == 0x25 {
+        early_uart_print("[EL2] Data Abort (EL2)");
+    }
 
     loop { asm!("wfi"); }
 }
@@ -336,31 +433,27 @@ pub unsafe extern "C" fn sync_current_el1() {
     asm!("mrs {}, elr_el2", out(reg) elr, options(nostack));
     asm!("mrs {}, far_el2", out(reg) far, options(nostack));
     asm!("mrs {}, spsr_el2", out(reg) spsr, options(nostack));
-    info!("[VECTOR] is from EL2 EL1 sync exception!");
-    info!("[VECTOR]   ESR_EL2={:#x} ELR_EL2={:#x} FAR_EL2={:#x} SPSR_EL2={:#x}", esr, elr, far, spsr);
+    // kprintln!("[VECTOR] is from EL2 EL1 sync exception!");
+    // kprintln!("[VECTOR]   ESR_EL2={:#x} ELR_EL2={:#x} FAR_EL2={:#x} SPSR_EL2={:#x}", esr, elr, far, spsr);
     loop { asm!("wfi"); }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sync_current_el0() {
-    info!("[VECTOR] is from EL2 EL0 sync exception!");
     loop { asm!("wfi"); }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn irq_current() {
-    info!("[VECTOR] is from EL2 IRQ!");
     loop { asm!("wfi"); }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn fiq_current() {
-    info!("[VECTOR] is from EL2 FIQ!");
     loop { asm!("wfi"); }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn serror_current() {
-    info!("[VECTOR] is from EL2 SError!");
     loop { asm!("wfi"); }
 }

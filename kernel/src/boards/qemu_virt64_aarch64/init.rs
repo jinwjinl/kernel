@@ -19,6 +19,7 @@ use crate::{
         irq,
         irq::{IrqHandler, IrqTrigger, Priority},
         registers::cntfrq_el0::CNTFRQ_EL0,
+        virt::{hvc_call, early_uart_print, early_uart_print_hex},
     },
     error::Error,
     irq::IrqTrace,
@@ -56,9 +57,25 @@ pub(crate) fn init() {
         );
     });
     STAGING.run(7, true, || arch::secondary_cpu_setup(config::PSCI_BASE));
-    //Add to init virt
-    STAGING.run(8, true, || {
-    crate::arch::aarch64::virt::virt_init();
+    // 8. Virtualization PoC
+    STAGING.run(8, true, || {    
+        let ret = hvc_call(0x00, 0, 0);
+        if ret != 0 {
+            unsafe { early_uart_print("[HOST] VMM_INIT failed!"); }
+            return;
+        }
+        
+        // 2. Create VCPU 0
+        let ret = hvc_call(0x01, 0, 0);
+        if ret != 0 {
+            unsafe { early_uart_print("[HOST] VCPU_INIT failed!"); }
+            return;
+        }
+        
+        // 3. Run VCPU 0 (Switch to Guest)
+        let ret = hvc_call(0x02, 0, 0);
+        
+        // unsafe { early_uart_print_hex("[HOST] Back from Guest! Ret= ", ret); }
     });
     
     if arch::current_cpu_id() != 0 {

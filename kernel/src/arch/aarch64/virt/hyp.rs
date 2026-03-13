@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use tock_registers::interfaces::{Readable, Writeable};
-use log::info;
+use crate::kprintln;
 use crate::arch::aarch64::{
     registers::hcr_el2::HCR_EL2,
     registers::sctlr_el2::SCTLR_EL2,
@@ -87,13 +87,27 @@ pub fn read_spsr_el2() -> u64 {
 }
 
 #[inline]
-fn configure_hcr_el2() {
+pub fn configure_hcr_el2_for_guest() {
+    super::mmu_s2::init_stage2(0x4800_0000, 0x10_0000);
     HCR_EL2.write(
         HCR_EL2::VM::Enable
             + HCR_EL2::RW::EL1AArch64
-            + HCR_EL2::AMO::EL2Handled
             + HCR_EL2::IMO::EL2Handled
             + HCR_EL2::FMO::EL2Handled
+            + HCR_EL2::AMO::EL2Handled
+    );
+    unsafe {
+        core::arch::asm!("isb");
+    }
+}
+
+#[inline]
+fn configure_hcr_el2() {
+    HCR_EL2.write(
+        HCR_EL2::RW::EL1AArch64
+        // + HCR_EL2::AMO::EL2Handled
+        // + HCR_EL2::IMO::EL2Handled
+        // + HCR_EL2::FMO::EL2Handled
     );
 }
 
@@ -119,74 +133,69 @@ fn configure_vector_table(vector_base: usize) {
 
 #[inline]
 fn configure_timer_el2() {
-    // CNTHCTL_EL2: 控制对定时器寄存器的访问
-    // Bit 0: EL1PCTEN (不 trap 物理计数访问)
-    // Bit 1: EL1PCEN (不 trap 物理定时器访问)
+    // CNTHCTL_EL2: control register for EL2 access to the physical timer and counter registers
+    // Bit 0: EL1PCTEN (don't trap EL1 access to the physical counter)
+    // Bit 1: EL1PCEN (don't trap EL1 access to the physical timer)
     let cnthctl: u64 = 0x3;
     unsafe {
         core::arch::asm!("msr CNTHCTL_EL2, {}", in(reg) cnthctl);
     }
     
-    // CNTVOFF_EL2: 虚拟定时器偏移
+    // CNTVOFF_EL2: virtual timer offset register
     let cntvoff: u64 = 0;
     unsafe {
         core::arch::asm!("msr CNTVOFF_EL2, {}", in(reg) cntvoff);
     }
 }
 
-/// Hypervisor 初始化
-pub fn hyp_init() {
-    // 配置 HCR_EL2
-    configure_hcr_el2();
-    
-    // 配置 SCTLR_EL2
-    configure_sctlr_el2();
+#[inline]
+pub fn shutdown_guest() {
+    HCR_EL2.write(
+        HCR_EL2::RW::EL1AArch64
+    );
+    unsafe {
+        core::arch::asm!("isb");
+    }
+}
 
-    // 配置 EL2 定时器控制
+/// Hypervisor initialization
+pub fn hyp_init() {
+    configure_hcr_el2();
     configure_timer_el2();
 
-    // 内存屏障
     unsafe {
         core::arch::asm!("dsb sy", options(nostack));
         core::arch::asm!("isb sy", options(nostack));
     }
+
     
-    // 获取向量表地址
+    // Do not configure SCTLR_EL2 and VBAR_EL2 for the time being to avoid exceptions.
+    // configure_sctlr_el2();
     let vector_base = vector::get_vector_table_addr();
     configure_vector_table(vector_base);
-
-    print_hcr_el2_info();
 }
 
 pub fn print_hcr_el2_info() {
     let hcr = read_hcr_el2();
     
-    info!("HCR_EL2 information:");
-    info!("  Base value: {:#018x}", hcr);
-    info!("  VM: {}", (hcr & 1) != 0);
-    info!("  RW: {}", (hcr & (1 << 31)) != 0);
-    info!("  AMO: {}", (hcr & (1 << 3)) != 0);
-    info!("  IMO: {}", (hcr & (1 << 4)) != 0);
-    info!("  FMO: {}", (hcr & (1 << 5)) != 0);
+    kprintln!("HCR_EL2 information:");
+    kprintln!("  Base value: {:#018x}", hcr);
+    kprintln!("  VM: {}", (hcr & 1) != 0);
+    kprintln!("  RW: {}", (hcr & (1 << 31)) != 0);
+    kprintln!("  AMO: {}", (hcr & (1 << 3)) != 0);
+    kprintln!("  IMO: {}", (hcr & (1 << 4)) != 0);
+    kprintln!("  FMO: {}", (hcr & (1 << 5)) != 0);
 }
 
-/// 从 EL2 进入 EL1 (Guest)
 #[inline]
 pub fn enter_guest(entry: usize, stack_top: usize, pstate: u64) {
     unsafe {
-        // 设置 SP_EL1
         core::arch::asm!("msr sp_el1, {}", in(reg) stack_top);
-        
-        // 设置 ELR_EL2 (返回地址)
         core::arch::asm!("msr elr_el2, {}", in(reg) entry as u64);
-        
-        // 设置 SPSR_EL2 (目标 PSTATE)
         core::arch::asm!("msr spsr_el2, {}", in(reg) pstate);
-        
         core::arch::asm!("dsb sy", options(nostack));
         core::arch::asm!("isb sy", options(nostack));
-        
-        // 切换
+    
         core::arch::asm!("eret");
     }
 }

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use core::arch::asm;
-use log::info;
+use crate::kprintln;
 use super::VCPU_MANAGER;
 
 const MAX_LR: usize = 4;
@@ -46,13 +46,11 @@ static mut VGIC_CPU_STATES: [Vgic; MAX_VCPUS] = [Vgic::new(); MAX_VCPUS];
 // Per-CPU Initialization (called by vCPU on first run)
 pub fn cpu_init(vcpu_id: usize) {
     unsafe {
-        // Force reset VGIC state to ensure clean memory
         if vcpu_id < MAX_VCPUS {
             let vgic = &mut VGIC_CPU_STATES[vcpu_id];
             vgic.pending_head = 0;
             vgic.pending_tail = 0;
             vgic.pending_count = 0;
-            // No need to zero pending_irqs as we use head/tail
         }
 
         // 1. Enable System Register access for EL2 (ICC_SRE_EL2)
@@ -85,7 +83,7 @@ pub fn inject(vcpu_id: usize, intid: u32) {
         let vgic = &mut VGIC_CPU_STATES[vcpu_id];
         
         if vgic.pending_count >= MAX_PENDING {
-            info!("[VGIC] Error: Queue full, drop IRQ {}", intid);
+            kprintln!("[VGIC] Error: Queue full, drop IRQ {}", intid);
             return;
         }
         
@@ -102,7 +100,7 @@ pub fn flush(vcpu_id: usize) {
             
             // Sanity check for memory corruption
             if vgic.pending_head >= MAX_PENDING || vgic.pending_tail >= MAX_PENDING {
-                info!("[VGIC] Corruption detected! Resetting state. head={:#x} tail={:#x}", vgic.pending_head, vgic.pending_tail);
+                kprintln!("[VGIC] Corruption detected! Resetting state. head={:#x} tail={:#x}", vgic.pending_head, vgic.pending_tail);
                 vgic.pending_head = 0;
                 vgic.pending_tail = 0;
                 vgic.pending_count = 0;
@@ -110,7 +108,7 @@ pub fn flush(vcpu_id: usize) {
 
             // Debug print to diagnose corruption
             if vgic.pending_count > 0 {
-                 info!("[VGIC] Flush: head={} tail={} count={}", 
+                 kprintln!("[VGIC] Flush: head={} tail={} count={}", 
                           vgic.pending_head, vgic.pending_tail, vgic.pending_count);
             }
 
@@ -125,7 +123,7 @@ pub fn flush(vcpu_id: usize) {
                 let lr = read_lr(i);
                 let state = (lr >> 62) & 0x3;
                 if state == 2 { // Active
-                    info!("[VGIC] Force clearing Active LR{} (IRQ {})", i, lr & 0x3FF);
+                    kprintln!("[VGIC] Force clearing Active LR{} (IRQ {})", i, lr & 0x3FF);
                     write_lr(i, 0);
                 }
             }
@@ -152,7 +150,7 @@ pub fn flush(vcpu_id: usize) {
                 // }
                 
                 write_lr(i, lr_val);
-                info!("[VGIC] Flushed IRQ {} to LR{}", intid, i);
+                kprintln!("[VGIC] Flushed IRQ {} to LR{}", intid, i);
                 free_mask &= !(1 << i);
             }
         }
