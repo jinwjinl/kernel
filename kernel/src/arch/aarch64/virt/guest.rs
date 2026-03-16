@@ -112,7 +112,7 @@ pub unsafe extern "C" fn guest_entry() -> ! {
         "b.eq 301f",
         "eret",
         "301:",
-        "hvc #1",r
+        "hvc #1",
         "eret",
 
         // ==========================================

@@ -22,7 +22,6 @@ use crate::{
         virt::{hvc_call, early_uart_print, early_uart_print_hex},
     },
     error::Error,
-    irq::IrqTrace,
     scheduler,
     support::SmpStagedInit,
     time,
@@ -43,15 +42,12 @@ pub(crate) fn init() {
     });
     STAGING.run(4, false, arch::irq::cpu_init);
     STAGING.run(5, false, || {
-        irq::enable_irq_with_priority(
-            config::PL011_UART0_IRQNUM,
-            arch::current_cpu_id(),
-            irq::Priority::Normal,
-        );
+        let sys_clk = (CNTFRQ_EL0.get() * 1000) as u32;
+        time::systick_init(sys_clk);
     });
     STAGING.run(6, false, || {
         irq::enable_irq_with_priority(
-            config::GENERIC_TIMER_IRQNUM,
+            config::PL011_UART0_IRQNUM,
             arch::current_cpu_id(),
             irq::Priority::Normal,
         );
@@ -89,7 +85,6 @@ pub(crate) fn init() {
         irq::IrqTrigger::Level,
     );
     let _ = irq::register_handler(config::PL011_UART0_IRQNUM, Box::new(Serial0Irq {}));
-    let _ = irq::register_handler(config::GENERIC_TIMER_IRQNUM, Box::new(TimerIrq {}));
 }
 
 crate::define_peripheral! {
@@ -108,7 +103,6 @@ crate::define_pin_states!(None);
 pub struct Serial0Irq {}
 impl IrqHandler for Serial0Irq {
     fn handle(&mut self) {
-        let _trace = IrqTrace::new(config::PL011_UART0_IRQNUM);
         let uart = get_device!(console_uart);
         if let Some(handler) = unsafe {
             let intr_handler_cell = &*uart.intr_handler.get();
@@ -116,12 +110,5 @@ impl IrqHandler for Serial0Irq {
         } {
             handler();
         }
-    }
-}
-
-pub struct TimerIrq;
-impl IrqHandler for TimerIrq {
-    fn handle(&mut self) {
-        crate::time::handle_clock_interrupt();
     }
 }
