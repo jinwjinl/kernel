@@ -231,8 +231,11 @@ pub unsafe extern "C" fn sync_from_lower_el1_rust(frame: *mut u64) -> u64 {
             }
             0x01 => { // HVC #1: VCPU_INIT (Create VCPU)
                 early_uart_print("[EL2] VCPU_INIT: Creating VCPU 0...");
+                
+                // Run guest in-place. Stage-2 MMU will be configured to identity-map this address.
                 let entry = guest::guest_entry as usize;
                 let stack_top = guest::GUEST_STACK_TOP;
+                
                 early_uart_print_hex("[EL2] VCPU_INIT: entry=", entry as u64);
                 match VCPU_MANAGER.0.create_vcpu(0, entry, stack_top) {
                     Ok(_) => {

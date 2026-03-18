@@ -174,6 +174,8 @@ pub unsafe extern "C" fn guest_entry() -> ! {
         // ------------------------------------------
         // [STEP 4] Shutdown
         // ------------------------------------------
+        "nop",
+        "nop",
         "hvc #0x20",
 
         // Shouldn't reach here.

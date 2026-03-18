@@ -84,10 +84,7 @@ pub fn get_current_vcpu_id() -> Option<usize> {
 
 
 pub fn virt_init() {
-    // let el = get_current_el();
-    // unsafe { early_uart_print_hex("[VIRT] Current EL:", el); }
     hyp_init();
-    unsafe { early_uart_print("[EL2] virt_init finished"); }
 }
 
 pub fn virt_start_guest() {  

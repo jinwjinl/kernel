@@ -26,7 +26,7 @@ use tock_registers::interfaces::*;
 #[derive(Clone, Copy)]
 struct S2PageTable([u64; 512]);
 
-const POOL_SIZE: usize = 16;
+const POOL_SIZE: usize = 128;
 static mut PAGE_TABLE_POOL: [S2PageTable; POOL_SIZE] = [S2PageTable([0; 512]); POOL_SIZE];
 static mut POOL_INDEX: usize = 0;
 static mut S2_L1: S2PageTable = S2PageTable([0; 512]);
