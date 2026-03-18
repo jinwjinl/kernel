@@ -55,13 +55,6 @@ macro_rules! enable_interrupt {
 macro_rules! enter_el1 {
     () => {
         "
-        // Park secondary cores (CPU ID != 0)
-        mrs x0, mpidr_el1
-        and x0, x0, #0xFF
-        cbz x0, 1f
-    2:  wfi
-        b 2b
-    1:
         mrs x0, cpacr_el1
         orr x0, x0, #(0x3 << 20)
         msr cpacr_el1, x0
@@ -71,17 +64,25 @@ macro_rules! enter_el1 {
         orr     x0, x0, #3
         msr     cnthctl_el2, x0
         msr     cntvoff_el2, xzr
-        // Setup stack for EL2 and call virt_init
+        // Enable AArch64 in EL1.
+        // Calculate per-core stack offset
         ldr x1, ={stack_end}
+        mrs x9, mpidr_el1
+        and x9, x9, #0xff
+        lsl x9, x9, #14
+        sub x1, x1, x9
         mov sp, x1
         msr sp_el1, x1
+        // Enable to switch into EL2.
         bl {virt_init}
         // Set EL1 sp and mask daif in EL2.
         mov x0, #0x3C5
         msr spsr_el2, x0
         // Set EL1 entry and enter.
         ldr x0, ={stack_start}
-        ldr x1, ={stack_end}
+        ldr x1, ={stack_end}  
+        // We reserve the top 4KB of each core's 16KB chunk for EL2.
+        sub x1, x1, #0x1000
         ldr x2, ={cont}
         adr x3, {entry}
         msr elr_el2, x3
