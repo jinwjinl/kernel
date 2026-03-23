@@ -193,7 +193,15 @@ pub unsafe extern "C" fn sync_from_lower_el1_rust(frame: *mut u64) -> u64 {
                 *frame.add(31) = VCPU_MANAGER.0.host_elr;
                 *frame.add(32) = VCPU_MANAGER.0.host_spsr;
                 *frame.add(33) = VCPU_MANAGER.0.host_sp;
+                
+                // Restore Host GPRs (x0-x30)
+                for i in 0..31 {
+                    *frame.add(i) = VCPU_MANAGER.0.host_regs[i];
+                }
+                
+                // Return value 0 for success (overwrites x0)
                 *frame.add(0) = 0;
+                
                 return 2;
             }
 
@@ -250,10 +258,16 @@ pub unsafe extern "C" fn sync_from_lower_el1_rust(frame: *mut u64) -> u64 {
             }
             0x02 => { // HVC #2: VCPU_RUN (Run VCPU)
                 early_uart_print("[EL2] VCPU_RUN: Switching to Guest...");
-                // Save host return address.
+                // Save host return address and state
                 VCPU_MANAGER.0.host_elr  = *frame.add(31);
                 VCPU_MANAGER.0.host_spsr = *frame.add(32);
                 VCPU_MANAGER.0.host_sp   = *frame.add(33);
+                
+                // Save Host GPRs (x0-x30)
+                for i in 0..31 {
+                    VCPU_MANAGER.0.host_regs[i] = *frame.add(i);
+                }
+
                 early_uart_print_hex("[EL2] Host ELR saved", VCPU_MANAGER.0.host_elr);
                 
                 // CRITICAL: Enable Virtualization (VM bit) ONLY before entering Guest
