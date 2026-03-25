@@ -171,7 +171,6 @@ fn handle_hvc(vcpu: &mut Vcpu, info: &VmExitInfo) -> bool {
             // will overwrite the hardware register with the old (0) value!
             context.vbar_el1 = vbar;
             vgic::inject_irq(32);
-            context.elr_el2 += 4;
             return true;
         }
         0x14 => {

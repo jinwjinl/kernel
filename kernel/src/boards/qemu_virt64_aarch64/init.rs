@@ -61,15 +61,13 @@ pub(crate) fn init() {
     STAGING.run(8, true, || {    
         let ret = hvc_call(0x00, 0, 0);
         if ret != 0 {
-            unsafe { early_uart_print("[HOST] VMM_INIT failed!"); }
-            return;
+            unreachable!("[HOST] VMM_INIT failed!");
         }
         
         // 2. Create VCPU 0
         let ret = hvc_call(0x01, 0, 0);
         if ret != 0 {
-            unsafe { early_uart_print("[HOST] VCPU_INIT failed!"); }
-            return;
+            unreachable!("[HOST] VCPU_INIT failed!");
         }
         
         // 3. Run VCPU 0 (Switch to Guest)

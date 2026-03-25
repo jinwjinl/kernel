@@ -160,6 +160,8 @@ pub unsafe extern "C" fn guest_entry() -> ! {
         // ------------------------------------------
         // [STEP 3] IRQ inject to test vGIC
         // ------------------------------------------
+        "nop",
+        "nop",
         "hvc #0x13",
         "mov x2, #200",
         "510:",
