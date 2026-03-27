@@ -114,7 +114,7 @@ pub fn flush(vcpu_id: usize) {
             }
 
             let mut elrsr: u64;
-        asm!("mrs {}, S3_4_C12_C11_5", out(reg) elrsr);
+            asm!("mrs {}, S3_4_C12_C11_5", out(reg) elrsr);
         
         // Force clean Active LRs to prevent deadlock
         // If an LR is Active (State=2), it means Guest has Acked it.
@@ -125,7 +125,7 @@ pub fn flush(vcpu_id: usize) {
                 let state = (lr >> 62) & 0x3;
                 if state == 2 { // Active
                     // kprintln!("[VGIC] Force clearing Active LR{} (IRQ {})", i, lr & 0x3FF);
-                    write_lr(i, 0);
+                    // write_lr(i, 0);
                 }
             }
         }
@@ -138,6 +138,23 @@ pub fn flush(vcpu_id: usize) {
         for i in 0..MAX_LR {
             if (free_mask & (1 << i)) != 0 && vgic.pending_count > 0 {
                 let intid = vgic.pending_irqs[vgic.pending_head];
+
+                let already_in_lr = (0..MAX_LR).any(|j| {
+                    if (elrsr & (1 << j)) == 0 {
+                        let lr = read_lr(j);
+                        let lr_intid = lr & 0xFFFF;
+                        let lr_state = (lr >> 62) & 0x3;
+                        lr_intid == intid as u64 && lr_state != 0
+                    } else {
+                        false
+                    }
+                });
+
+                if already_in_lr {
+                    // 跳过，不重复注入
+                    break;
+                }
+                
                 vgic.pending_head = (vgic.pending_head + 1) % MAX_PENDING;
                 vgic.pending_count -= 1;
                 

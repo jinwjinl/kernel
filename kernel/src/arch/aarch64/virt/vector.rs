@@ -198,9 +198,22 @@ pub unsafe extern "C" fn sync_from_lower_el1_rust(frame: *mut u64) -> u64 {
                 for i in 0..31 {
                     *frame.add(i) = VCPU_MANAGER.0.host_regs[i];
                 }
+                let host_vbar = VCPU_MANAGER.0.host_vbar;
+                    core::arch::asm!(
+                    "msr vbar_el1, {v}",
+                    "isb",
+                    v = in(reg) host_vbar,
+                    options(nostack, nomem)
+                );
                 
-                // Return value 0 for success (overwrites x0)
-                *frame.add(0) = 0;
+                core::arch::asm!("dsb sy", options(nostack, nomem));
+
+                unsafe { 
+                    early_uart_print_hex("[SHUTDOWN] Writing host_elr to frame", VCPU_MANAGER.0.host_elr);
+                    early_uart_print_hex("[SHUTDOWN] Writing host_spsr to frame", VCPU_MANAGER.0.host_spsr);
+                    early_uart_print_hex("[SHUTDOWN] Writing host_sp to frame", VCPU_MANAGER.0.host_sp);
+                    early_uart_print_hex("[SHUTDOWN] frame ptr", frame as u64);
+                }
                 
                 return 2;
             }
@@ -268,7 +281,12 @@ pub unsafe extern "C" fn sync_from_lower_el1_rust(frame: *mut u64) -> u64 {
                     VCPU_MANAGER.0.host_regs[i] = *frame.add(i);
                 }
 
+                let vbar: u64;
+                core::arch::asm!("mrs {}, vbar_el1",out(reg) vbar);
+                VCPU_MANAGER.0.host_vbar = vbar;
                 early_uart_print_hex("[EL2] Host ELR saved", VCPU_MANAGER.0.host_elr);
+                early_uart_print_hex("[EL2] Host SPSR saved", VCPU_MANAGER.0.host_spsr);
+                early_uart_print_hex("[EL2] Host SP saved", VCPU_MANAGER.0.host_sp);
                 
                 // CRITICAL: Enable Virtualization (VM bit) ONLY before entering Guest
                 hyp::configure_hcr_el2_for_guest();  
@@ -276,6 +294,7 @@ pub unsafe extern "C" fn sync_from_lower_el1_rust(frame: *mut u64) -> u64 {
             }
             _ => {
                 early_uart_print_hex("[EL2] Unknown Host HVC: ", func_id);
+                early_uart_print_hex("[EL2]   ELR", elr);
             }
         }        
         return 1; // Resume

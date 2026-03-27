@@ -93,6 +93,8 @@ pub unsafe extern "C" fn guest_entry() -> ! {
 
         "201:",
         "msr S3_0_C12_C12_1, x0",  // ICC_EOIR1_EL1: EOI
+        "isb",
+        "hvc #0x15",
 
         "ldp x4, x5, [sp, #32]",
         "ldp x2, x3, [sp, #16]",
@@ -145,15 +147,28 @@ pub unsafe extern "C" fn guest_entry() -> ! {
         // ------------------------------------------
         // [STEP 2] MMU Stage-2 test
         // ------------------------------------------
-        "movz x0, #0x0000",
-        "movk x0, #0x4800, lsl #16",
-        "ldr x1, [x0]",
+        "movz x5, #0x0000",
+        "movk x5, #0x4780, lsl #16",    // x5 = 0x4780_0000（已映射，远离代码/栈）
+        "movz x6, #0xABCD",
+        "movk x6, #0x1234, lsl #16",    // x6 = 0x1234_ABCD（魔数）
+        "str x6, [x5]",                  // 写入
+        "dsb sy",
+        "ldr x7, [x5]",                  // 读回
+        "cmp x6, x7",
+        "b.ne 503f",                     // 不一致 → 失败
         "mov x0, #0x51",
-        "hvc #0x10", 
-        "movz x0, #0x0000",
-        "movk x0, #0x5000, lsl #16",
-        "ldr x1, [x0]", 
+        "hvc #0x10",                     // 上报：[STEP 2a] 映射地址读写 OK
+        "b 504f",
 
+        "503:",
+        "mov x0, #0x5F",                 // 失败码
+        "hvc #0x10",                     // 上报：[STEP 2a] 读写不一致，FAIL
+
+        // Test 2b: 访问未映射地址，期望触发 Stage-2 Fault 并被 EL2 跳过
+        "504:",
+        "movz x0, #0x0000",
+        "movk x0, #0x5000, lsl #16",    // 0x5000_0000（未映射）
+        "ldr x1, [x0]",                  // 触发 Stage-2 Translation Fault，EL2 跳过此指令
         "mov x0, #0x52",
         "hvc #0x10",
 

@@ -85,6 +85,12 @@ pub fn handle_vm_exit(vcpu: &mut Vcpu) -> bool {
             unsafe { early_uart_print("[EXIT] Data Abort from Guest (Stage-2 Fault)"); }
             let iss = esr & 0x1FFFFFF;
             let dfsc = iss & 0x3F;
+            unsafe { early_uart_print_hex("[EXIT]   DFSC", dfsc); }
+            unsafe { early_uart_print_hex("[EXIT]   FAR_EL2", {
+                let far: u64;
+                core::arch::asm!("mrs {}, far_el2", out(reg) far, options(nostack));
+                far
+            }); }
             if (dfsc & 0x3C) == 0x04 || (dfsc & 0x3C) == 0x08 || (dfsc & 0x3C) == 0x0C {
                 // Translation fault (level 0/1/2/3) - Stage-2 未映射
                 unsafe { early_uart_print("[EXIT]   Stage-2 Translation Fault - skipping instruction"); }
@@ -139,8 +145,14 @@ fn handle_hvc(vcpu: &mut Vcpu, info: &VmExitInfo) -> bool {
             unsafe { early_uart_print_hex("[EXIT] HVC#0x10: Guest status, x0=", context.regs[0]); }
             match context.regs[0] {
                 0xDEAD_BEEF => unsafe { early_uart_print("[EXIT]   [STEP 1] Hello from Guest!"); },
-                0x51        => unsafe { early_uart_print("[EXIT]   [STEP 2] MMU mapped addr read OK"); },
-                0x52        => unsafe { early_uart_print("[EXIT]   [STEP 2] Returned after Stage-2 Fault"); },
+                0x51        => unsafe { 
+                    early_uart_print("[EXIT]   [STEP 2a] Mapped addr R/W OK (Stage-2 identity map verified)");
+                    // 可选：EL2 侧交叉验证（identity map 下 IPA == PA）
+                    let val = core::ptr::read_volatile(0x4780_0000usize as *const u64);
+                    early_uart_print_hex("[EXIT]   [STEP 2a] EL2 cross-check val", val);
+                 },
+                0x52        => unsafe { early_uart_print("[EXIT]   [STEP 2b] Stage-2 Fault handled, Guest resumed OK (isolation verified)"); },
+                0x5F        => unsafe { early_uart_print("[EXIT]   [STEP 2a] FAILED: mapped addr R/W mismatch!"); },
                 0x49        => unsafe { early_uart_print("[EXIT]   [STEP 3] IRQ handling done"); },
                 _           => {}
             }
@@ -176,6 +188,12 @@ fn handle_hvc(vcpu: &mut Vcpu, info: &VmExitInfo) -> bool {
         0x14 => {
             unsafe { early_uart_print("[EXIT]   HVC#0x14: Inject FIQ 33"); }
             vgic::inject_fiq(33);
+            context.elr_el2 += 4;
+            return true;
+        }
+        0x15 => {
+            let intid = context.regs[0] as u32;
+            unsafe { early_uart_print_hex("[EXIT]   HVC#0x15: IRQ EOI done, INTID=", intid as u64); }
             context.elr_el2 += 4;
             return true;
         }

@@ -479,6 +479,7 @@ pub struct VcpuManager {
     pub host_sp: u64,
     pub host_spsr: u64,
     pub host_regs: [u64; 31],
+    pub host_vbar: u64,
 }
 
 impl VcpuManager {
@@ -492,6 +493,7 @@ impl VcpuManager {
             host_sp: 0,
             host_spsr: 0,
             host_regs: [0; 31],
+            host_vbar: 0,
         }
     }
     

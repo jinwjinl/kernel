@@ -106,9 +106,6 @@ pub fn configure_hcr_el2_for_guest() {
 fn configure_hcr_el2() {
     HCR_EL2.write(
         HCR_EL2::RW::EL1AArch64
-        // + HCR_EL2::AMO::EL2Handled
-        // + HCR_EL2::IMO::EL2Handled
-        // + HCR_EL2::FMO::EL2Handled
     );
 }
 
@@ -153,8 +150,15 @@ fn configure_timer_el2() {
 pub fn shutdown_guest() {
     HCR_EL2.write(
         HCR_EL2::RW::EL1AArch64
+            + HCR_EL2::SWIO::Set
     );
     unsafe {
+        // Disable vGIC CPU interface to restore normal physical IRQ handling
+        let mut ich_hcr: u64;
+        core::arch::asm!("mrs {}, S3_4_C12_C11_0", out(reg) ich_hcr);
+        ich_hcr &= !1; // Clear En bit
+        core::arch::asm!("msr S3_4_C12_C11_0, {}", in(reg) ich_hcr);
+        
         core::arch::asm!("isb");
     }
 }
