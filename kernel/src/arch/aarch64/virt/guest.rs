@@ -153,6 +153,7 @@ pub unsafe extern "C" fn guest_entry() -> ! {
         "movk x6, #0x1234, lsl #16",    // x6 = 0x1234_ABCD（魔数）
         "str x6, [x5]",                  // 写入
         "dsb sy",
+        "isb",
         "ldr x7, [x5]",                  // 读回
         "cmp x6, x7",
         "b.ne 503f",                     // 不一致 → 失败
@@ -178,6 +179,7 @@ pub unsafe extern "C" fn guest_entry() -> ! {
         "nop",
         "nop",
         "hvc #0x13",
+        "nop",
         "mov x2, #200",
         "510:",
         "nop",

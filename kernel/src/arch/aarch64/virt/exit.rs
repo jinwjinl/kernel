@@ -85,12 +85,36 @@ pub fn handle_vm_exit(vcpu: &mut Vcpu) -> bool {
             unsafe { early_uart_print("[EXIT] Data Abort from Guest (Stage-2 Fault)"); }
             let iss = esr & 0x1FFFFFF;
             let dfsc = iss & 0x3F;
-            unsafe { early_uart_print_hex("[EXIT]   DFSC", dfsc); }
-            unsafe { early_uart_print_hex("[EXIT]   FAR_EL2", {
+            // unsafe { early_uart_print_hex("[EXIT]   DFSC", dfsc); }
+            // unsafe { early_uart_print_hex("[EXIT]   FAR_EL2", {
+            //     let far: u64;
+            //     core::arch::asm!("mrs {}, far_el2", out(reg) far, options(nostack));
+            //     far
+            // }); }
+
+            let is_write = (iss & (1 << 6)) != 0; // WnR bit
+            
+            // ELR_EL2 保存了触发这个 Data Abort 的 Guest 汇编指令地址
+            let faulting_pc = vcpu.context().elr_el2; 
+
+            unsafe { 
+                early_uart_print("=====================================");
+                early_uart_print("[EXIT] PoC Guest triggered Data Abort!");
+                early_uart_print_hex("[EXIT]   1. Faulting PC (ELR_EL2) : ", faulting_pc);
+                early_uart_print_hex("[EXIT]   2. Target Addr (FAR_EL2) : ", {
                 let far: u64;
                 core::arch::asm!("mrs {}, far_el2", out(reg) far, options(nostack));
                 far
-            }); }
+            });
+                if is_write {
+                    early_uart_print("[EXIT]   3. Access Type           : WRITE");
+                } else {
+                    early_uart_print("[EXIT]   3. Access Type           : READ");
+                }
+                early_uart_print_hex("[EXIT]   4. DFSC Code             : ", dfsc as u64);
+                early_uart_print("=====================================");
+            }
+
             if (dfsc & 0x3C) == 0x04 || (dfsc & 0x3C) == 0x08 || (dfsc & 0x3C) == 0x0C {
                 // Translation fault (level 0/1/2/3) - Stage-2 未映射
                 unsafe { early_uart_print("[EXIT]   Stage-2 Translation Fault - skipping instruction"); }
@@ -183,6 +207,7 @@ fn handle_hvc(vcpu: &mut Vcpu, info: &VmExitInfo) -> bool {
             // will overwrite the hardware register with the old (0) value!
             context.vbar_el1 = vbar;
             vgic::inject_irq(32);
+            context.elr_el2 += 4;
             return true;
         }
         0x14 => {

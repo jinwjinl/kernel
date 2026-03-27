@@ -208,12 +208,12 @@ pub unsafe extern "C" fn sync_from_lower_el1_rust(frame: *mut u64) -> u64 {
                 
                 core::arch::asm!("dsb sy", options(nostack, nomem));
 
-                unsafe { 
-                    early_uart_print_hex("[SHUTDOWN] Writing host_elr to frame", VCPU_MANAGER.0.host_elr);
-                    early_uart_print_hex("[SHUTDOWN] Writing host_spsr to frame", VCPU_MANAGER.0.host_spsr);
-                    early_uart_print_hex("[SHUTDOWN] Writing host_sp to frame", VCPU_MANAGER.0.host_sp);
-                    early_uart_print_hex("[SHUTDOWN] frame ptr", frame as u64);
-                }
+                // unsafe { 
+                //     early_uart_print_hex("[SHUTDOWN] Writing host_elr to frame", VCPU_MANAGER.0.host_elr);
+                //     early_uart_print_hex("[SHUTDOWN] Writing host_spsr to frame", VCPU_MANAGER.0.host_spsr);
+                //     early_uart_print_hex("[SHUTDOWN] Writing host_sp to frame", VCPU_MANAGER.0.host_sp);
+                //     early_uart_print_hex("[SHUTDOWN] frame ptr", frame as u64);
+                // }
                 
                 return 2;
             }

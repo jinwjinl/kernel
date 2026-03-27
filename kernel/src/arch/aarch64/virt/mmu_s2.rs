@@ -107,7 +107,7 @@ pub fn init_stage2(ipa_base: usize, size: usize) {
     unsafe { POOL_INDEX = 0; }
 
     map_range(ipa_base, ipa_base, size, false);
-    map_range(0x4800_0000, 0x4800_0000, 0x0010_0000, false);
+    // map_range(0x4800_0000, 0x4800_0000, 0x0010_0000, false);
     map_range(0x0900_0000, 0x0900_0000, 4096, true);
 
     unsafe {
