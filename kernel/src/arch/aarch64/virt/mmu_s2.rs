@@ -20,6 +20,7 @@ use crate::arch::aarch64::{
     },
 };
 use tock_registers::interfaces::*;
+use semihosting::println;
 
 // Structure of Page Table.
 #[repr(align(4096))]
@@ -34,7 +35,7 @@ static mut S2_L1: S2PageTable = S2PageTable([0; 512]);
 // Stage-2 Descriptor
 const S2_DESC_TABLE:    u64 = 3;
 const S2_DESC_PAGE:     u64 = 3;
-const S2_ATTR_NORMAL:   u64 = 0 << 2;
+const S2_ATTR_NORMAL:   u64 = 0xF << 2;
 const S2_ATTR_DEVICE:   u64 = 1 << 2;
 const S2_ATTR_S2AP_RW:  u64 = 3 << 6;
 const S2_ATTR_SH_INNER: u64 = 3 << 8;
@@ -107,12 +108,10 @@ pub fn init_stage2(ipa_base: usize, size: usize) {
     unsafe { POOL_INDEX = 0; }
 
     map_range(ipa_base, ipa_base, size, false);
-    // map_range(0x4800_0000, 0x4800_0000, 0x0010_0000, false);
+    // for guest visting uart
     map_range(0x0900_0000, 0x0900_0000, 4096, true);
 
-    unsafe {
-        crate::arch::aarch64::virt::early_uart_print("[S2MMU] init_stage2 done.");
-    }
+    semihosting::println!("[S2MMU] init_stage2 done.");
 
     unsafe {
         core::arch::asm!("dsb sy", options(nostack, nomem));
@@ -146,5 +145,40 @@ pub fn init_stage2(ipa_base: usize, size: usize) {
         core::arch::asm!("tlbi vmalls12e1", options(nostack, nomem));
         core::arch::asm!("dsb sy", options(nostack, nomem));
         core::arch::asm!("isb sy", options(nostack, nomem));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blueos_test_macro::test;
+
+    #[test]
+    fn test_page_table_allocation() {
+        unsafe { POOL_INDEX = 0; }
+        
+        let table1 = alloc_page_table();
+        assert!(table1.is_some(), "Should allocate first table");
+        
+        unsafe {
+            let idx = POOL_INDEX;
+            assert_eq!(idx, 1);
+        }
+    }
+
+    #[test]
+    fn test_stage2_attributes_generation() {
+        // Normal Memory should be 0xF << 2 (Inner & Outer WB Cacheable)
+        // Device Memory should be 0x1 << 2 (Device-nGnRE)
+        
+        let attr_normal = S2_ATTR_S2AP_RW | S2_ATTR_AF | S2_ATTR_SH_INNER | S2_ATTR_NORMAL;
+        let attr_device = S2_ATTR_S2AP_RW | S2_ATTR_AF | S2_ATTR_SH_INNER | S2_ATTR_DEVICE;
+
+        // Extract MemAttr field (Bits[5:2])
+        let mem_attr_normal = (attr_normal >> 2) & 0xF;
+        let mem_attr_device = (attr_device >> 2) & 0xF;
+
+        assert_eq!(mem_attr_normal, 0xF, "Normal memory attribute must be 0b1111 to prevent Alignment Faults");
+        assert_eq!(mem_attr_device, 0x1, "Device memory attribute must be 0b0001");
     }
 }

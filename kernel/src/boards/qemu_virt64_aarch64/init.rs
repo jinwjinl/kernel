@@ -19,7 +19,7 @@ use crate::{
         irq,
         irq::{IrqHandler, IrqTrigger, Priority},
         registers::cntfrq_el0::CNTFRQ_EL0,
-        virt::{hvc_call, early_uart_print, early_uart_print_hex},
+        virt::hvc_call,
     },
     error::Error,
     irq::IrqTrace,

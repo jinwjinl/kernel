@@ -14,8 +14,9 @@
 
 
 use core::arch::asm;
-use super::{VCPU_MANAGER, early_uart_print, early_uart_print_hex, vgic, hyp, guest};
+use super::{VCPU_MANAGER, vgic, hyp, guest};
 use crate::arch::aarch64::virt::exit::{handle_vm_exit, is_guest_shutdown, clear_guest_shutdown};
+use semihosting::println;
 
 static mut PRINTED_ALIGN: bool = false;
 
@@ -207,14 +208,6 @@ pub unsafe extern "C" fn sync_from_lower_el1_rust(frame: *mut u64) -> u64 {
                 );
                 
                 core::arch::asm!("dsb sy", options(nostack, nomem));
-
-                // unsafe { 
-                //     early_uart_print_hex("[SHUTDOWN] Writing host_elr to frame", VCPU_MANAGER.0.host_elr);
-                //     early_uart_print_hex("[SHUTDOWN] Writing host_spsr to frame", VCPU_MANAGER.0.host_spsr);
-                //     early_uart_print_hex("[SHUTDOWN] Writing host_sp to frame", VCPU_MANAGER.0.host_sp);
-                //     early_uart_print_hex("[SHUTDOWN] frame ptr", frame as u64);
-                // }
-                
                 return 2;
             }
 
@@ -246,55 +239,80 @@ pub unsafe extern "C" fn sync_from_lower_el1_rust(frame: *mut u64) -> u64 {
         
         match func_id {
             0 => { 
-                early_uart_print("[EL2] VMM_INIT: Host requested init (already done in boot).");
+                semihosting::println!("[EL2] VMM_INIT: Host requested init (already done in boot).");
                 core::ptr::write_volatile(frame.add(0), 0u64); // Success
-                early_uart_print_hex("[EL2] Return ELR", *frame.add(31));
+                semihosting::println!("[EL2] Return ELR: {:#x}", *frame.add(31));
             }
             0x01 => { // HVC #1: VCPU_INIT (Create VCPU)
-                early_uart_print("[EL2] VCPU_INIT: Creating VCPU 0...");
+                semihosting::println!("[EL2] VCPU_INIT: Creating VCPU 0...");
                 
                 // Run guest in-place. Stage-2 MMU will be configured to identity-map this address.
                 let entry = guest::guest_entry as usize;
                 let stack_top = guest::GUEST_STACK_TOP;
                 
-                early_uart_print_hex("[EL2] VCPU_INIT: entry=", entry as u64);
+                semihosting::println!("[EL2] VCPU_INIT: entry= {}", entry as u64);
                 match VCPU_MANAGER.0.create_vcpu(0, entry, stack_top) {
                     Ok(_) => {
-                        early_uart_print("[EL2] VCPU_INIT: OK, setting x0=0");
+                        semihosting::println!("[EL2] VCPU_INIT: OK, setting x0=0");
                         core::ptr::write_volatile(frame.add(0), 0u64);
                     },
                     Err(e) => {
-                        early_uart_print("[EL2] VCPU_INIT: FAILED");
+                        semihosting::println!("[EL2] VCPU_INIT: FAILED");
                         core::ptr::write_volatile(frame.add(0), 1u64);
                     }
                 }
             }
             0x02 => { // HVC #2: VCPU_RUN (Run VCPU)
-                early_uart_print("[EL2] VCPU_RUN: Switching to Guest...");
-                // Save host return address and state
-                VCPU_MANAGER.0.host_elr  = *frame.add(31);
+                let target_vcpu_id = *frame.add(1) as usize; 
+                semihosting::println!("[EL2] VCPU_RUN: Switching to Guest vCPU {}", target_vcpu_id);
+
+                if let Some(vcpu) = VCPU_MANAGER.0.get_vcpu(target_vcpu_id) {
+                    if !vcpu.can_run() {
+                        semihosting::println!("[EL2] ERROR: vCPU is not in a runnable state!");
+                        *frame.add(0) = 1;
+                        return 1;
+                    }
+
+                // 1. Save Host Context
+                VCPU_MANAGER.0.host_elr = *frame.add(31);
                 VCPU_MANAGER.0.host_spsr = *frame.add(32);
-                VCPU_MANAGER.0.host_sp   = *frame.add(33);
-                
-                // Save Host GPRs (x0-x30)
-                for i in 0..31 {
-                    VCPU_MANAGER.0.host_regs[i] = *frame.add(i);
-                }
+                VCPU_MANAGER.0.host_sp = *frame.add(33);
+                for i in 0..31 { VCPU_MANAGER.0.host_regs[i] = *frame.add(i); }
 
                 let vbar: u64;
-                core::arch::asm!("mrs {}, vbar_el1",out(reg) vbar);
+                core::arch::asm!("mrs {}, vbar_el1", out(reg) vbar);
                 VCPU_MANAGER.0.host_vbar = vbar;
-                early_uart_print_hex("[EL2] Host ELR saved", VCPU_MANAGER.0.host_elr);
-                early_uart_print_hex("[EL2] Host SPSR saved", VCPU_MANAGER.0.host_spsr);
-                early_uart_print_hex("[EL2] Host SP saved", VCPU_MANAGER.0.host_sp);
-                
-                // CRITICAL: Enable Virtualization (VM bit) ONLY before entering Guest
+
+                // 2. Configure HCR_EL2 for guest
                 hyp::configure_hcr_el2_for_guest();  
-                VCPU_MANAGER.0.run_vcpu(0);
+                
+                // 3. Prepare Guest Context
+                vcpu.prepare_run(); 
+                VCPU_MANAGER.0.set_current_vcpu(target_vcpu_id); 
+                
+                let ctx = vcpu.context();
+                for i in 0..31 { *frame.add(i) = ctx.regs[i]; }
+                *frame.add(31) = ctx.elr_el2;
+                *frame.add(32) = ctx.spsr;
+                *frame.add(33) = ctx.sp;
+                
+                core::arch::asm!(
+                    "msr sctlr_el1, {}",
+                    "msr vbar_el1, {}",
+                    in(reg) 0x30D00800u64,
+                    in(reg) ctx.vbar_el1,
+                    options(nostack, nomem)
+                );
+                
+                vgic::flush(target_vcpu_id); 
+            } else {
+                semihosting::println!("[EL2] ERROR: Requested vCPU ID does not exist!");
+                *frame.add(0) = 1;
+            }
             }
             _ => {
-                early_uart_print_hex("[EL2] Unknown Host HVC: ", func_id);
-                early_uart_print_hex("[EL2]   ELR", elr);
+                semihosting::println!("[EL2] Unknown Host HVC: {}", func_id);
+                semihosting::println!("[EL2]   ELR: {:#x}", elr);
             }
         }        
         return 1; // Resume
@@ -422,14 +440,14 @@ pub unsafe extern "C" fn fiq_from_lower_el1() {
 /// Solve serror from lower el1.
 #[no_mangle]
 pub unsafe extern "C" fn serror_from_lower_el1() {
-    // kprintln!("[VECTOR] is from EL1 SError!");
+    semihosting::println!("[VECTOR] is from EL1 SError!");
     asm!("eret", options(noreturn));
 }
 
 /// Solve sync exception from lower el2 sp0.
 #[no_mangle]
 pub unsafe extern "C" fn sync_current_sp0() {
-    // kprintln!("[VECTOR] is from EL2 SP0 sync exception!");
+   semihosting::println!("[VECTOR] is from EL2 SP0 sync exception!");
     loop { asm!("wfi"); }
 }
 
@@ -442,18 +460,18 @@ pub unsafe extern "C" fn sync_current_spx() {
     asm!("mrs {}, elr_el2", out(reg) elr, options(nostack));
     asm!("mrs {}, far_el2", out(reg) far, options(nostack));
 
-    early_uart_print("[EL2] CRITICAL: Sync Exception from EL2 (SPx)!");
-    early_uart_print_hex("  ESR_EL2", esr);
-    early_uart_print_hex("  ELR_EL2", elr);
-    early_uart_print_hex("  FAR_EL2", far);
+    semihosting::println!("[EL2] CRITICAL: Sync Exception from EL2 (SPx)!");
+    semihosting::println!("  ESR_EL2: {:#x}", esr);
+    semihosting::println!("  ELR_EL2: {:#x}", elr);
+    semihosting::println!("  FAR_EL2: {:#x}", far);
     
     // Attempt to decode syndrome
     let ec = (esr >> 26) & 0x3F;
-    early_uart_print_hex("  Exception Class (EC)", ec);
+    semihosting::println!("  Exception Class (EC): {:#x}", ec);
     
     // Data Abort from same EL
     if ec == 0x25 {
-        early_uart_print("[EL2] Data Abort (EL2)");
+        semihosting::println!("[EL2] Data Abort (EL2)");
     }
 
     loop { asm!("wfi"); }

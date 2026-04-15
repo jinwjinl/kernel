@@ -20,54 +20,28 @@ pub mod mmu_el2;
 pub mod mmu_s2;
 pub mod vgic;
 pub mod vector;
+pub mod vtimer;
 
 pub use vcpu::{Vcpu, VcpuManager, VcpuState};
 pub use exit::{VmExitReason, VmExitInfo};
 pub use hyp::{hyp_init, get_current_el};
-use crate::kprintln;
+pub use vgic::init;
+use semihosting::println;
 
 // PL011 UART addresses for QEMU Virt
 const UART0_DR: *mut u32 = 0x0900_0000 as *mut u32;
 const UART0_FR: *mut u32 = 0x0900_0018 as *mut u32;
 
-pub unsafe fn early_uart_putc(c: u8) {
-    core::ptr::write_volatile(UART0_DR, c as u32);
-}
-
-pub unsafe fn early_uart_print(s: &str) {
-    for c in s.bytes() {
-        early_uart_putc(c);
-    }
-    early_uart_putc(b'\r');
-    early_uart_putc(b'\n');
-}
-
-pub unsafe fn early_uart_print_hex(label: &str, val: u64) {
-    for c in label.bytes() {
-        early_uart_putc(c);
-    }
-    early_uart_putc(b':');
-    early_uart_putc(b' ');
-    early_uart_putc(b'0');
-    early_uart_putc(b'x');
-    for i in (0..16).rev() {
-        let digit = (val >> (i * 4)) & 0xF;
-        let c = if digit < 10 { b'0' + digit as u8 } else { b'a' + (digit - 10) as u8 };
-        early_uart_putc(c);
-    }
-    early_uart_putc(b'\r');
-    early_uart_putc(b'\n');
-}
 
 #[no_mangle]
 pub extern "C" fn trap_irq(_context: &mut crate::arch::aarch64::Context) -> usize {
-    kprintln!("[EL2] IRQ trap");
+    semihosting::println!("[EL2] IRQ trap");
     0
 }
 
 #[no_mangle]
 pub extern "C" fn trap_fiq(_context: &mut crate::arch::aarch64::Context) -> usize {
-    kprintln!("[EL2] FIQ trap");
+    semihosting::println!("[EL2] FIQ trap");
     0
 }
 
@@ -85,23 +59,9 @@ pub fn get_current_vcpu_id() -> Option<usize> {
 
 pub fn virt_init() {
     hyp_init();
+    vgic::init();
 }
 
-pub fn virt_start_guest() {  
-    let entry = guest::guest_entry as usize;
-    let stack_top = guest::GUEST_STACK_TOP;
-    
-    unsafe {
-        let vcpu = VCPU_MANAGER.0.create_vcpu(0, entry, stack_top)
-            .expect("Failed to create vCPU");
-        VCPU_MANAGER.0.run_vcpu(0);
-    }
-}
-
-/// Issue an HVC call to EL2
-/// func_id: Function ID (x0)
-/// arg1: Argument 1 (x1)
-/// arg2: Argument 2 (x2)
 pub fn hvc_call(func_id: u64, arg1: u64, arg2: u64) -> u64 {
     let result: u64;
     unsafe {

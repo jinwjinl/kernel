@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use core::arch::asm;
-use crate::kprintln;
-use super::{hyp::read_hcr_el2, vgic, early_uart_print, early_uart_print_hex};
+use super::{hyp::read_hcr_el2, vgic};
 
 /// HCR_EL2_VI: Enable virtual IRQ.
 const HCR_EL2_VI: u64 = 1 << 7;
@@ -115,7 +114,7 @@ impl Vcpu {
         context.elr_el2 = entry as u64;
         context.spsr = 0x3C5; // Default PSTATE: EL1h, DAIF masked
         context.vbar_el1 = (entry as u64 + 0x1000) & !0x7FF;
-        context.sp = stack_top as u64;
+        // context.sp = stack_top as u64;
         
         Self {
             id,
@@ -198,166 +197,12 @@ impl Vcpu {
         self.state = state;
     }
     
-    pub fn save_context(&mut self) {
-        let x0_value: u64;
-        unsafe {
-            asm!("mov {}, x0", out(reg) x0_value, options(nostack));
-        }
-
-        self.context.regs[0] = x0_value;
-        
-        unsafe {
-            asm!(
-                "stp x1,  x2,  [x0, #8]",
-                "stp x3,  x4,  [x0, #24]",
-                "stp x5,  x6,  [x0, #40]",
-                "stp x7,  x8,  [x0, #56]",
-                "stp x9,  x10, [x0, #72]",
-                "stp x11, x12, [x0, #88]",
-                "stp x13, x14, [x0, #104]",
-                "stp x15, x16, [x0, #120]",
-                "stp x17, x18, [x0, #136]",
-                "stp x19, x20, [x0, #152]",
-                "stp x21, x22, [x0, #168]",
-                "stp x23, x24, [x0, #184]",
-                "stp x25, x26, [x0, #200]",
-                "stp x27, x28, [x0, #216]",
-                "stp x29, x30, [x0, #232]",
-                in("x0") &mut self.context.regs as *mut u64,
-                options(nostack)
-            );
-        }
-        
-        self.context.elr_el2 = Self::read_elr_el2();
-        self.context.sp      = Self::read_sp();
-        self.context.pstate  = Self::read_pstate();
-        self.context.spsr    = Self::read_spsr_el2();
-        self.context.vbar_el1 = Self::read_vbar_el1();
-    }
-    
-    pub fn restore_context(&mut self) {
-        // Note: ELR_EL1 and SPSR_EL1 are Guest registers. 
-        // We should NOT overwrite them with ELR_EL2/SPSR_EL2.
-        
-        // Self::write_elr_el1(self.context.elr_el2); // REMOVED: Incorrect
-        Self::write_sp(self.context.sp);
-        // Self::write_pstate(self.context.pstate); // REMOVED: Incorrect (Affects EL2)
-        // Self::write_spsr_el1(self.context.spsr); // REMOVED: Incorrect
-        Self::write_vbar_el1(self.context.vbar_el1);
-        
-        unsafe {
-            asm!(
-                "ldp x1,  x2,  [x0, #8]",
-                "ldp x3,  x4,  [x0, #24]",
-                "ldp x5,  x6,  [x0, #40]",
-                "ldp x7,  x8,  [x0, #56]",
-                "ldp x9,  x10, [x0, #72]",
-                "ldp x11, x12, [x0, #88]",
-                "ldp x13, x14, [x0, #104]",
-                "ldp x15, x16, [x0, #120]",
-                "ldp x17, x18, [x0, #136]",
-                "ldp x19, x20, [x0, #152]",
-                "ldp x21, x22, [x0, #168]",
-                "ldp x23, x24, [x0, #184]",
-                "ldp x25, x26, [x0, #200]",
-                "ldp x27, x28, [x0, #216]",
-                "ldp x29, x30, [x0, #232]",
-                in("x0") &self.context.regs as *const u64,
-                options(nostack)
-            );
-        }
-        
-        unsafe {
-            asm!("mov x0, {}", in(reg) self.context.regs[0], options(nostack));
-        }
-    }
-
-    pub fn restore_regs(&self) {
-        unsafe {
-            asm!(
-                "ldp x1,  x2,  [x0, #8]",
-                "ldp x3,  x4,  [x0, #24]",
-                "ldp x5,  x6,  [x0, #40]",
-                "ldp x7,  x8,  [x0, #56]",
-                "ldp x9,  x10, [x0, #72]",
-                "ldp x11, x12, [x0, #88]",
-                "ldp x13, x14, [x0, #104]",
-                "ldp x15, x16, [x0, #120]",
-                "ldp x17, x18, [x0, #136]",
-                "ldp x19, x20, [x0, #152]",
-                "ldp x21, x22, [x0, #168]",
-                "ldp x23, x24, [x0, #184]",
-                "ldp x25, x26, [x0, #200]",
-                "ldp x27, x28, [x0, #216]",
-                "ldp x29, x30, [x0, #232]",
-                in("x0") &self.context.regs as *const u64,
-                options(nostack)
-            );
-            asm!("mov x0, {}", in(reg) self.context.regs[0], options(nostack));
-        }
-    }
-    
-    pub fn run(&mut self) {
+    pub fn prepare_run(&mut self) {
         if self.state == VcpuState::Stopped {
+            #[cfg(not(test))]
             vgic::cpu_init(self.id);
         }
         self.state = VcpuState::Running;
-        
-        // Flush pending IRQs to LRs（留空）
-        // vgic::flush(self.id);
-        
-        let hcr = read_hcr_el2();
-        
-        if self.pending_irq {
-            // vgic::inject_irq(32);
-        }
-        if self.pending_fiq {
-            // vgic::inject_fiq(33);
-        }
-
-        let sctlr_el1 = 0x30D00800u64;
-        let ctx_ptr = &self.context as *const VcpuStateStruct;
-        
-        unsafe {
-            asm!(
-                // 1. Configure System Registers
-                "msr sctlr_el1, {sctlr}",
-                "msr sp_el1, {sp}",
-                "msr elr_el2, {elr}",
-                "msr spsr_el2, {spsr}",
-                
-                // 2. Restore General Purpose Registers (x1-x30)
-                "ldp x1,  x2,  [x0, #8]",
-                "ldp x3,  x4,  [x0, #24]",
-                "ldp x5,  x6,  [x0, #40]",
-                "ldp x7,  x8,  [x0, #56]",
-                "ldp x9,  x10, [x0, #72]",
-                "ldp x11, x12, [x0, #88]",
-                "ldp x13, x14, [x0, #104]",
-                "ldp x15, x16, [x0, #120]",
-                "ldp x17, x18, [x0, #136]",
-                "ldp x19, x20, [x0, #152]",
-                "ldp x21, x22, [x0, #168]",
-                "ldp x23, x24, [x0, #184]",
-                "ldp x25, x26, [x0, #200]",
-                "ldp x27, x28, [x0, #216]",
-                "ldp x29, x30, [x0, #232]",
-                
-                // 3. Restore x0 last
-                "ldr x0, [x0, #0]",
-                
-                "dsb ish",
-                "isb sy",
-                "eret",
-                
-                sctlr = in(reg) sctlr_el1,
-                sp = in(reg) self.context.sp,
-                elr = in(reg) self.context.elr_el2,
-                spsr = in(reg) self.context.spsr,
-                in("x0") ctx_ptr,
-                options(noreturn)
-            );
-        }
     }
     
     pub fn inject_irq(&mut self) {
@@ -375,97 +220,6 @@ impl Vcpu {
         self.state == VcpuState::Stopped || 
         self.state == VcpuState::Paused ||
         self.state == VcpuState::Exited
-    }
-    
-
-    #[inline]
-    fn read_elr_el2() -> u64 {
-        let elr: u64;
-        unsafe {
-            asm!("mrs {}, elr_el2", out(reg) elr, options(nostack));
-        }
-        elr
-    }
-    
-
-    #[inline]
-    fn write_elr_el1(elr: u64) {
-        unsafe {
-            asm!("msr elr_el1, {}", in(reg) elr, options(nostack, nomem));
-        }
-    }
-    
-    #[inline]
-    fn read_sp() -> u64 {
-        let sp: u64;
-        unsafe {
-            asm!("mov {}, sp", out(reg) sp, options(nostack));
-        }
-        sp
-    }
-    
-    #[inline]
-    fn write_sp(sp: u64) {
-        unsafe {
-            asm!("mov sp, {}", in(reg) sp, options(nostack, nomem));
-        }
-    }
-
-    #[inline]
-    fn read_sp_el1() -> u64{
-        let sp_el1: u64;
-        unsafe {
-            asm!("mrs {}, sp_el1", out(reg) sp_el1, options(nostack));
-        }
-        sp_el1
-    }
-
-    #[inline]
-    fn read_pstate() -> u64 {
-        let pstate: u64;
-        unsafe {
-            asm!("mrs {}, daif", out(reg) pstate, options(nostack));
-        }
-        pstate
-    }
-    
-    #[inline]
-    fn write_pstate(pstate: u64) {
-        unsafe {
-            asm!("msr daif, {}", in(reg) pstate, options(nostack, nomem));
-        }
-    }
-    
-    #[inline]
-    fn read_spsr_el2() -> u64 {
-        let spsr: u64;
-        unsafe {
-            asm!("mrs {}, spsr_el2", out(reg) spsr, options(nostack));
-        }
-        spsr
-    }
-    
-    #[inline]
-    fn write_spsr_el1(spsr: u64) {
-        unsafe {
-            asm!("msr spsr_el1, {}", in(reg) spsr, options(nostack, nomem));
-        }
-    }
-
-    #[inline]
-    fn read_vbar_el1() -> u64 {
-        let vbar: u64;
-        unsafe {
-            asm!("mrs {}, vbar_el1", out(reg) vbar, options(nostack));
-        }
-        vbar
-    }
-
-    #[inline]
-    fn write_vbar_el1(vbar: u64) {
-        unsafe {
-            asm!("msr vbar_el1, {}", in(reg) vbar, options(nostack, nomem));
-        }
     }
 }
 
@@ -523,28 +277,6 @@ impl VcpuManager {
         Ok(self.vcpus[id].as_mut().unwrap())
     }
     
-    pub fn run_vcpu(&mut self, vcpu_id: usize) {
-        let vcpu = match self.vcpus[vcpu_id].as_mut() {
-            Some(v) => v,
-            None => {
-                unsafe { early_uart_print("[VCPU] Error: vCPU not found"); }
-                return;
-            }
-        };
-        
-        if !vcpu.can_run() {
-            unsafe { early_uart_print("[VCPU] Warning: vCPU state error."); }
-            return;
-        }
-        
-        unsafe { early_uart_print_hex("[VCPU] Running vCPU :", vcpu.id().try_into().unwrap()); }
-        unsafe { early_uart_print_hex("[VCPU]   Entry: ", vcpu.entry_point().try_into().unwrap()); }
-        unsafe { early_uart_print_hex("[VCPU]   Stack Top: ", vcpu.stack_top().try_into().unwrap()); }
-        
-        self.current_vcpu = Some(vcpu_id);
-        vcpu.run();
-    }
-
     pub fn clear_current_vcpu(&mut self) {
         self.current_vcpu = None;
     }
@@ -557,6 +289,11 @@ impl VcpuManager {
     #[inline]
     pub fn current_vcpu_id(&self) -> Option<usize> {
         self.current_vcpu
+    }
+
+    #[inline]
+    pub fn set_current_vcpu(&mut self, id: usize) {
+        self.current_vcpu = Some(id);
     }
     
     #[inline]
@@ -600,5 +337,64 @@ impl core::fmt::Display for VcpuError {
             VcpuError::InvalidState => 
                 write!(f, "vCPU state invalid for this operation"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use blueos_test_macro::test;
+
+    #[test]
+    fn test_vcpu_state_struct_lifecycle() {
+        let mut state = VcpuStateStruct::new();
+        assert!(!state.is_valid());
+
+        state.set_elr(0x4000_0000);
+        state.sp = 0x4100_0000;
+        assert!(state.is_valid());
+
+        state.set_spsr(0x3C5);
+        assert_eq!(state.spsr(), 0x3C5);
+
+        state.reset();
+        assert_eq!(state.elr(), 0);
+        assert!(!state.is_valid());
+    }
+
+    #[test]
+    fn test_vcpu_manager_allocation() {
+        let mut manager = VcpuManager::new();
+        assert_eq!(manager.vcpu_count(), 0);
+        assert!(!manager.has_running());
+
+        let vcpu0 = manager.create_vcpu(0, 0x4000_0000, 0x4100_0000).expect("Failed to create vCPU 0");
+        assert_eq!(vcpu0.id(), 0);
+        assert_eq!(vcpu0.entry_point(), 0x4000_0000);
+        assert_eq!(vcpu0.state(), VcpuState::Stopped);
+
+        let err_duplicate = manager.create_vcpu(0, 0x4000_0000, 0x4100_0000);
+        assert!(err_duplicate.is_err(), "Should not allow duplicate vCPU ID");
+
+        let err_out_of_bounds = manager.create_vcpu(4, 0x4000_0000, 0x4100_0000);
+        assert!(err_out_of_bounds.is_err(), "Should reject ID >= MAX_VCPUS");
+
+        manager.create_vcpu(1, 0x4000_0000, 0x4100_0000).unwrap();
+        manager.create_vcpu(2, 0x4000_0000, 0x4100_0000).unwrap();
+        manager.create_vcpu(3, 0x4000_0000, 0x4100_0000).unwrap();
+        assert_eq!(manager.vcpu_count(), 4);
+    }
+
+    #[test]
+    fn test_vcpu_context_switch_preparation() {
+        let mut manager = VcpuManager::new();
+        manager.create_vcpu(0, 0x4000_0000, 0x4100_0000).unwrap();
+        
+        let vcpu = manager.get_vcpu(0).unwrap();
+        assert!(vcpu.can_run());
+        
+        vcpu.prepare_run();
+        assert_eq!(vcpu.state(), VcpuState::Running);
+        assert!(!vcpu.can_run(), "Running vCPU should not be marked as can_run to prevent re-entry");
     }
 }

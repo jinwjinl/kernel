@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use tock_registers::interfaces::{Readable, Writeable};
-use crate::kprintln;
+use semihosting::println;
 use crate::arch::aarch64::{
     registers::hcr_el2::HCR_EL2,
     registers::sctlr_el2::SCTLR_EL2,
@@ -89,7 +89,7 @@ pub fn read_spsr_el2() -> u64 {
 #[inline]
 pub fn configure_hcr_el2_for_guest() {
     // Identity map 128MB of RAM starting from 0x4000_0000 so the Guest can run in-place
-    super::mmu_s2::init_stage2(0x4000_0000, 0x0800_0000); 
+    super::mmu_s2::init_stage2(0x4028_0000, 0x0200_0000); 
     HCR_EL2.write(
         HCR_EL2::VM::Enable
             + HCR_EL2::RW::EL1AArch64
@@ -183,13 +183,13 @@ pub fn hyp_init() {
 pub fn print_hcr_el2_info() {
     let hcr = read_hcr_el2();
     
-    kprintln!("HCR_EL2 information:");
-    kprintln!("  Base value: {:#018x}", hcr);
-    kprintln!("  VM: {}", (hcr & 1) != 0);
-    kprintln!("  RW: {}", (hcr & (1 << 31)) != 0);
-    kprintln!("  AMO: {}", (hcr & (1 << 3)) != 0);
-    kprintln!("  IMO: {}", (hcr & (1 << 4)) != 0);
-    kprintln!("  FMO: {}", (hcr & (1 << 5)) != 0);
+    semihosting::println!("HCR_EL2 information:");
+    semihosting::println!("  Base value: {:#018x}", hcr);
+    semihosting::println!("  VM: {}", (hcr & 1) != 0);
+    semihosting::println!("  RW: {}", (hcr & (1 << 31)) != 0);
+    semihosting::println!("  AMO: {}", (hcr & (1 << 3)) != 0);
+    semihosting::println!("  IMO: {}", (hcr & (1 << 4)) != 0);
+    semihosting::println!("  FMO: {}", (hcr & (1 << 5)) != 0);
 }
 
 #[inline]
