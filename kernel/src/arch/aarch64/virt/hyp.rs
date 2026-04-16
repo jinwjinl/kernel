@@ -192,15 +192,37 @@ pub fn print_hcr_el2_info() {
     semihosting::println!("  FMO: {}", (hcr & (1 << 5)) != 0);
 }
 
-#[inline]
-pub fn enter_guest(entry: usize, stack_top: usize, pstate: u64) {
-    unsafe {
-        core::arch::asm!("msr sp_el1, {}", in(reg) stack_top);
-        core::arch::asm!("msr elr_el2, {}", in(reg) entry as u64);
-        core::arch::asm!("msr spsr_el2, {}", in(reg) pstate);
-        core::arch::asm!("dsb sy", options(nostack));
-        core::arch::asm!("isb sy", options(nostack));
+// #[inline]
+// pub fn enter_guest(entry: usize, stack_top: usize, pstate: u64) {
+//     unsafe {
+//         core::arch::asm!("msr sp_el1, {}", in(reg) stack_top);
+//         core::arch::asm!("msr elr_el2, {}", in(reg) entry as u64);
+//         core::arch::asm!("msr spsr_el2, {}", in(reg) pstate);
+//         core::arch::asm!("dsb sy", options(nostack));
+//         core::arch::asm!("isb sy", options(nostack));
     
-        core::arch::asm!("eret");
+//         core::arch::asm!("eret");
+//     }
+// }
+
+// For GuestOS
+#[inline]
+pub fn enter_guest(entry: usize, dtb_addr: usize, pstate: u64) {
+    unsafe {
+        core::arch::asm!(
+            "msr elr_el2, {entry}",
+            "msr spsr_el2, {pstate}",
+            "mov x0, {dtb}",
+            "mov x1, xzr",
+            "mov x2, xzr",
+            "mov x3, xzr",
+            "dsb sy",
+            "isb sy",
+            "eret",
+            entry = in(reg) entry as u64,
+            pstate = in(reg) pstate,
+            dtb = in(reg) dtb_addr as u64,
+            options(noreturn)
+        );
     }
 }

@@ -19,7 +19,7 @@ use crate::{
         irq,
         irq::{IrqHandler, IrqTrigger, Priority},
         registers::cntfrq_el0::CNTFRQ_EL0,
-        virt::hvc_call,
+        virt::{hvc_call, virt_boot_linux},
     },
     error::Error,
     irq::IrqTrace,
@@ -58,23 +58,23 @@ pub(crate) fn init() {
     });
     STAGING.run(7, true, || arch::secondary_cpu_setup(config::PSCI_BASE));
     // 8. Virtualization PoC
-    STAGING.run(8, true, || {    
-        let ret = hvc_call(0x00, 0, 0);
-        if ret != 0 {
-            unreachable!("[HOST] VMM_INIT failed!");
-        }
+    // STAGING.run(8, true, || {    
+    //     let ret = hvc_call(0x00, 0, 0);
+    //     if ret != 0 {
+    //         unreachable!("[HOST] VMM_INIT failed!");
+    //     }
         
-        // 2. Create VCPU 0
-        let ret = hvc_call(0x01, 0, 0);
-        if ret != 0 {
-            unreachable!("[HOST] VCPU_INIT failed!");
-        }
+    //     // 2. Create VCPU 0
+    //     let ret = hvc_call(0x01, 0, 0);
+    //     if ret != 0 {
+    //         unreachable!("[HOST] VCPU_INIT failed!");
+    //     }
         
-        // 3. Run VCPU 0 (Switch to Guest)
-        let ret = hvc_call(0x02, 0, 0);
+    //     // 3. Run VCPU 0 (Switch to Guest)
+    //     let ret = hvc_call(0x02, 0, 0);
         
-        // unsafe { early_uart_print_hex("[HOST] Back from Guest! Ret= ", ret); }
-    });
+    //     // unsafe { early_uart_print_hex("[HOST] Back from Guest! Ret= ", ret); }
+    // });
     
     if arch::current_cpu_id() != 0 {
         scheduler::wait_and_then_start_schedule();
@@ -88,6 +88,7 @@ pub(crate) fn init() {
     );
     let _ = irq::register_handler(config::PL011_UART0_IRQNUM, Box::new(Serial0Irq {}));
     let _ = irq::register_handler(config::GENERIC_TIMER_IRQNUM, Box::new(TimerIrq {}));
+    // virt_boot_linux();
 
 }
 

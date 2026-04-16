@@ -254,6 +254,10 @@ fn handle_gicr_read(vcpu_id: usize, offset: u64) -> u32 {
             }
             val
         }
+        0x000C => {
+            //Nowaday, we only have one core and basic mapping, so the high 32 bits are 0.
+            0
+        }
         0x10100 => redist.isenabler0,
         0x10180 => redist.isenabler0,
         0x10200 => redist.ispendr0,
