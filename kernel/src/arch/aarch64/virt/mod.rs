@@ -35,7 +35,75 @@ const UART0_FR: *mut u32 = 0x0900_0018 as *mut u32;
 
 #[no_mangle]
 pub extern "C" fn trap_irq(_context: &mut crate::arch::aarch64::Context) -> usize {
-    semihosting::println!("[EL2] IRQ trap");
+    unsafe{
+        let mut ctlr: u64;
+        core::arch::asm!("mrs {}, ICC_CTLR_EL1", out(reg) ctlr);
+        if (ctlr & (1 << 1)) == 0{
+            // set EOImode.
+            ctlr |= 1 << 1;
+            core::arch::asm!("msr ICC_CTLR_EL1, {}", in(reg) ctlr);
+        }
+    }
+    let iar: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, ICC_IAR1_EL1", out(reg) iar);
+    }
+
+    let intid = iar & 0xFFFFFF;
+
+    if intid == 1023 {
+        // 1023 is Spurious Interrupt of GIC，skip
+        return 0;
+    }
+
+    if intid != 27 {
+        semihosting::println!("[EL2] IRQ trap! INTID: {}", intid);
+    }
+    if intid == 33 {
+        unsafe {
+            let lr_val: u64 = (1 << 62) | (1 << 61) | (1 << 60) | (0xA0 << 48) | (33 << 32) | 33;
+            
+            // Temporarily occupy physical register for uart print in Linux shell
+            core::arch::asm!("msr ICH_LR1_EL2, {}", in(reg) lr_val);
+            let mut hcr: u64;
+            core::arch::asm!("mrs {}, ICH_HCR_EL2", out(reg) hcr);
+            hcr |= 1;
+            core::arch::asm!("msr ICH_HCR_EL2, {}", in(reg) hcr);
+        }
+    } else if intid == 27 {
+        unsafe {
+            let mut ctl: u64;
+            core::arch::asm!("mrs {}, CNTV_CTL_EL0", out(reg) ctl);
+            ctl |= 1 << 1;
+            core::arch::asm!("msr CNTV_CTL_EL0, {}", in(reg) ctl);
+        }
+
+        if let Some(vcpu_id) = get_current_vcpu_id() {
+                vgic::inject_irq(vcpu_id, 27);
+        }
+
+        unsafe{
+            core::arch::asm!("msr ICC_EOIR1_EL1, {}", in(reg) iar);
+        }
+    } else {
+        semihosting::println!("[EL2] Unhandled Guest IRQ: {}", intid);
+        // For uninterruptible/unknown interrupts, 
+        // we must manually downgrade and deactivate them; 
+        // otherwise, the interrupt line will be permanently blocked.
+        unsafe { 
+            core::arch::asm!("msr ICC_EOIR1_EL1, {}", in(reg) iar); 
+            core::arch::asm!("msr ICC_DIR_EL1, {}", in(reg) iar);
+        }
+    }
+
+    unsafe {
+        core::arch::asm!("msr ICC_EOIR1_EL1, {}", in(reg) iar);
+    }
+
+    if let Some(vcpu_id) = get_current_vcpu_id() {
+        vgic::flush(vcpu_id);
+    }
+
     0
 }
 
@@ -76,32 +144,31 @@ pub fn hvc_call(func_id: u64, arg1: u64, arg2: u64) -> u64 {
     result
 }
 
-pub unsafe fn load_linux_to_guest() {
-    use crate::arch::aarch64::virt::guest;
+// pub unsafe fn load_linux_to_guest() {
+//     use crate::arch::aarch64::virt::guest;
     
-    let kernel_dest = guest::LINUX_KERNEL_LOAD_ADDR as *mut u8;
-    let dtb_dest = guest::LINUX_DTB_ADDR as *mut u8;
+//     let kernel_dest = guest::LINUX_KERNEL_LOAD_ADDR as *mut u8;
+//     let dtb_dest = guest::LINUX_DTB_ADDR as *mut u8;
 
-    core::ptr::copy_nonoverlapping(guest::LINUX_IMAGE.as_ptr(), kernel_dest, guest::LINUX_IMAGE.len());
-    core::ptr::copy_nonoverlapping(guest::LINUX_DTB.as_ptr(), dtb_dest, guest::LINUX_DTB.len());
-    core::arch::asm!("dsb sy", "isb");
-}
+//     core::ptr::copy_nonoverlapping(guest::LINUX_IMAGE.as_ptr(), kernel_dest, guest::LINUX_IMAGE.len());
+//     core::ptr::copy_nonoverlapping(guest::LINUX_DTB.as_ptr(), dtb_dest, guest::LINUX_DTB.len());
+//     core::arch::asm!("dsb sy", "isb");
+// }
 
 // Like virt_init but specifically for booting Linux
 pub fn virt_boot_linux() {
-    // Repeat set in virt_init！！！
-    // hyp_init();
+    // It will be placed here next.
     // vgic::init();
     vtimer::init_global_vtimer();
-    // mmu_s2::init_stage2(0x4028_0000, 0x0200_0000);
 
-    unsafe { 
-        load_linux_to_guest(); 
-    }
+    // unsafe { 
+    //     load_linux_to_guest(); 
+    // }
 
     unsafe {
-        let vcpu = VCPU_MANAGER.0.create_vcpu(0, 0x4028_0000, 0).unwrap();
-        vcpu.context_mut().regs[0] = 0x4180_0000;
+        let vcpu = VCPU_MANAGER.0.create_vcpu(0, guest::LINUX_KERNEL_LOAD_ADDR, 0).unwrap();
+        vcpu.context_mut().regs[0] = guest::LINUX_DTB_ADDR as u64;
+        vcpu.context_mut().spsr = 0x3C5;
     }
     vtimer::init_vcpu_timer();
 

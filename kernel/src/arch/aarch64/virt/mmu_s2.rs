@@ -27,7 +27,7 @@ use semihosting::println;
 #[derive(Clone, Copy)]
 struct S2PageTable([u64; 512]);
 
-const POOL_SIZE: usize = 128;
+const POOL_SIZE: usize = 256;
 static mut PAGE_TABLE_POOL: [S2PageTable; POOL_SIZE] = [S2PageTable([0; 512]); POOL_SIZE];
 static mut POOL_INDEX: usize = 0;
 static mut S2_L1: S2PageTable = S2PageTable([0; 512]);
@@ -111,8 +111,8 @@ pub fn init_stage2(ipa_base: usize, size: usize) {
     // for guest visting uart
     map_range(0x0900_0000, 0x0900_0000, 4096, true);
     // for vGICR and vGICD
-    map_range(0x0800_0000, 0x0800_0000, 0x0001_0000, true);
-    map_range(0x080A_0000, 0x080A_0000, 0x00F6_0000, true);
+    // map_range(0x0800_0000, 0x0800_0000, 0x0001_0000, true);
+    // map_range(0x080A_0000, 0x080A_0000, 0x00F6_0000, true);
 
     semihosting::println!("[S2MMU] init_stage2 done.");
 

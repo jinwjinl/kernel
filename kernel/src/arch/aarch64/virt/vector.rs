@@ -189,12 +189,14 @@ pub unsafe extern "C" fn sync_from_lower_el1_rust(frame: *mut u64) -> u64 {
 
             let ok = handle_vm_exit(vcpu);
             if !ok && is_guest_shutdown() {
+                unsafe { core::arch::asm!("msr daifset, #15"); }
                 clear_guest_shutdown();
+                hyp::shutdown_guest();
                 VCPU_MANAGER.0.clear_current_vcpu();
                 *frame.add(31) = VCPU_MANAGER.0.host_elr;
                 *frame.add(32) = VCPU_MANAGER.0.host_spsr;
                 *frame.add(33) = VCPU_MANAGER.0.host_sp;
-                
+                semihosting::println!("host_elr: {:x}, host_spsr: {:x}, host_sp: {:x}", VCPU_MANAGER.0.host_elr, VCPU_MANAGER.0.host_spsr, VCPU_MANAGER.0.host_sp);
                 // Restore Host GPRs (x0-x30)
                 for i in 0..31 {
                     *frame.add(i) = VCPU_MANAGER.0.host_regs[i];
@@ -277,6 +279,7 @@ pub unsafe extern "C" fn sync_from_lower_el1_rust(frame: *mut u64) -> u64 {
                     VCPU_MANAGER.0.host_elr = *frame.add(31);
                     VCPU_MANAGER.0.host_spsr = *frame.add(32);
                     VCPU_MANAGER.0.host_sp = *frame.add(33);
+                     semihosting::println!("host_elr: {:x}, host_spsr: {:x}, host_sp: {:x}", VCPU_MANAGER.0.host_elr, VCPU_MANAGER.0.host_spsr, VCPU_MANAGER.0.host_sp);
                     for i in 0..31 { VCPU_MANAGER.0.host_regs[i] = *frame.add(i); }
 
                     let vbar: u64;

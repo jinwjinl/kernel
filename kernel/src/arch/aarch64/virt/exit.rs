@@ -103,6 +103,12 @@ pub fn handle_vm_exit(vcpu: &mut Vcpu) -> bool {
                     semihosting::println!("[EXIT]   3. Access Type           : READ");
                 }
                 semihosting::println!("[EXIT]   4. DFSC Code             : {}", dfsc as u64);
+                let hpfar_el2: u64;
+                unsafe { core::arch::asm!("mrs {}, hpfar_el2", out(reg) hpfar_el2); }
+
+                // Caclate Linux want to access physical address (IPA)
+                let fault_ipa = (hpfar_el2 & 0x0000_00FF_FFFF_FFF0) << 8;
+                println!("Target Physical Addr (IPA): {:#x}", fault_ipa);
                 semihosting::println!("=====================================");
             }
 
@@ -112,10 +118,15 @@ pub fn handle_vm_exit(vcpu: &mut Vcpu) -> bool {
                     semihosting::println!("[EXIT]   Stage-2 Translation Fault - skipping instruction"); 
                     let far: u64;
                     core::arch::asm!("mrs {}, far_el2", out(reg) far, options(nostack));
+                    let hpfar_el2: u64;
+                    core::arch::asm!("mrs {}, hpfar_el2", out(reg) hpfar_el2, options(nostack));
+                    //Caculate exact PA for vGIC.
+                    let fault_ipa_base = (hpfar_el2 & 0x0000_00FF_FFFF_FFF0) << 8;
+                    let exact_ipa = fault_ipa_base | (far & 0xFFF);
                     let handled = vgic::handle_data_abort(
                             vcpu.id(),
                             esr,
-                            far as u64,
+                            exact_ipa,
                             &mut vcpu.context_mut().regs
                         );
                 
@@ -165,24 +176,35 @@ fn handle_hvc(vcpu: &mut Vcpu, info: &VmExitInfo) -> bool {
     // Easy HVC Services.
     match hvc_num {
         0x00 => {
-            let psci_func_id = context.regs[0];
-            if psci_func_id == 0x84000008 { // PSCI_SYSTEM_OFF
-                unsafe { 
-                    semihosting::println!("[EXIT] HVC#0: Linux requested PSCI_SYSTEM_OFF. Shutting down..."); 
-                    GUEST_SHUTDOWN = true;
+            let psci_func_id = context.regs[0] as u32;
+            match psci_func_id {
+                0x84000000 => {
+                    // PSCI_VERSION
+                    semihosting::println!("[EXIT] HVC#0: Linux requested PSCI_VERSION");
+                    context.regs[0] = 2; 
                 }
-                #[cfg(not(test))]
-                super::hyp::shutdown_guest();
-                return false;
-            } else {
-                semihosting::println!("[EXIT] Ignored PSCI call: {}", psci_func_id);
-                context.elr_el2 += 4;
-                return true;
+                0x84000008 | 0x84000009 => {
+                    // PSCI_SYSTEM_OFF
+                    unsafe { 
+                        semihosting::println!("[EXIT] HVC#0: Linux requested PSCI_SYSTEM_OFF. Shutting down...");
+                        // 🚨 强制触发一个软件断点，这会直接把控制权交还给 GDB
+                        // core::arch::asm!("brk #0"); 
+                        GUEST_SHUTDOWN = true;
+                    }
+                    return false;
+                }
+                _ => {
+                    semihosting::println!("[EXIT] HVC#0: Ignored PSCI call: {:#x}", psci_func_id);
+                    // We don't suuport this function.
+                    context.regs[0] = 0xFFFF_FFFF;
+                }
             }
+            // context.elr_el2 += 4;
+            return true;
         }
         0x01 => {
             semihosting::println!("[EXIT]   ESR_EL1: {}", context.regs[0]);
-            context.elr_el2 += 4;
+            // context.elr_el2 += 4;
             return true;
         }
         0x10 => {
@@ -199,7 +221,7 @@ fn handle_hvc(vcpu: &mut Vcpu, info: &VmExitInfo) -> bool {
                 0x49        => { semihosting::println!("[EXIT]   [STEP 3] IRQ handling done"); },
                 _           => {}
             }
-            context.elr_el2 += 4;
+            // context.elr_el2 += 4;
             return true;
         }
         0x11 => {
@@ -239,7 +261,7 @@ fn handle_hvc(vcpu: &mut Vcpu, info: &VmExitInfo) -> bool {
                 GUEST_SHUTDOWN = true;
             }
 
-            super::hyp::shutdown_guest();
+            // super::hyp::shutdown_guest();
             return false;
 
         }

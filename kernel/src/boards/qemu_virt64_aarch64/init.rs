@@ -57,24 +57,6 @@ pub(crate) fn init() {
         );
     });
     STAGING.run(7, true, || arch::secondary_cpu_setup(config::PSCI_BASE));
-    // 8. Virtualization PoC
-    // STAGING.run(8, true, || {    
-    //     let ret = hvc_call(0x00, 0, 0);
-    //     if ret != 0 {
-    //         unreachable!("[HOST] VMM_INIT failed!");
-    //     }
-        
-    //     // 2. Create VCPU 0
-    //     let ret = hvc_call(0x01, 0, 0);
-    //     if ret != 0 {
-    //         unreachable!("[HOST] VCPU_INIT failed!");
-    //     }
-        
-    //     // 3. Run VCPU 0 (Switch to Guest)
-    //     let ret = hvc_call(0x02, 0, 0);
-        
-    //     // unsafe { early_uart_print_hex("[HOST] Back from Guest! Ret= ", ret); }
-    // });
     
     if arch::current_cpu_id() != 0 {
         scheduler::wait_and_then_start_schedule();

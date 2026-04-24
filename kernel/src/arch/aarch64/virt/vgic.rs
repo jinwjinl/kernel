@@ -249,7 +249,10 @@ fn handle_gicr_read(vcpu_id: usize, offset: u64) -> u32 {
     match offset {
         0x0008 => {
             let mut val = (vcpu_id as u32) << 8;
-            if vcpu_id == MAX_VCPUS - 1 {
+            let active_vcpus = unsafe {
+                VCPU_MANAGER.0.vcpu_count()
+            };
+            if vcpu_id == active_vcpus - 1 {
                 val |= 1 << 4; // Last Redistributor
             }
             val
@@ -258,6 +261,7 @@ fn handle_gicr_read(vcpu_id: usize, offset: u64) -> u32 {
             //Nowaday, we only have one core and basic mapping, so the high 32 bits are 0.
             0
         }
+        0xFFE8 => 0x00000030,
         0x10100 => redist.isenabler0,
         0x10180 => redist.isenabler0,
         0x10200 => redist.ispendr0,
@@ -298,7 +302,7 @@ pub fn cpu_init(vcpu_id: usize) {
 pub fn inject(vcpu_id: usize, intid: u32) {
     unsafe {
         if vcpu_id >= MAX_VCPUS || intid >= 1024 { return; }
-        let is_enabled;
+        let mut is_enabled;
         if intid < 32 {
             let mut redist = get_vgic().redists[vcpu_id].lock();
             redist.ispendr0 |= 1 << intid;
@@ -313,6 +317,11 @@ pub fn inject(vcpu_id: usize, intid: u32) {
             let mask = 1 << (intid % 32);
             dist.ispendr[idx] |= mask;
             is_enabled = (dist.isenabler[idx] & mask) != 0;
+            
+            // Temporarily set for int 33 to get shell.
+            if intid == 33{
+                is_enabled = true;
+            } 
             drop(dist); 
 
             if is_enabled {
@@ -340,7 +349,9 @@ pub fn flush(vcpu_id: usize) {
             
             let is_active = is_irq_active_locked(&redist, intid);
             let state_bits: u64 = if is_active { 0b11 } else { 0b01 };
-            let lr_val: u64 = (state_bits << 62) | (1 << 60) | (intid as u64);
+            // Temporarily set priority(0xA0 << 48)
+            // To DO: Dynamically set hw bit(61) according to irq routing.
+            let lr_val: u64 = (state_bits << 62) | (1 << 61) | (1 << 60) | (0xA0 << 48) | ((intid as u64) << 32) | (intid as u64);
             write_lr(current_lr, lr_val);
             
             current_lr += 1;

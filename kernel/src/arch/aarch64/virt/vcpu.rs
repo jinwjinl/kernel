@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use core::arch::asm;
-use super::{hyp::read_hcr_el2, vgic};
+use super::{
+    hyp::{read_hcr_el2, write_hcr_el2}, vgic
+};
 
 /// HCR_EL2_VI: Enable virtual IRQ.
 const HCR_EL2_VI: u64 = 1 << 7;
@@ -207,12 +209,22 @@ impl Vcpu {
     
     pub fn inject_irq(&mut self) {
         self.pending_irq = true;
-        // TODO: achieve inject_irq
+        let hcr = read_hcr_el2();
+        write_hcr_el2(hcr | HCR_EL2_VI);
+
+        unsafe{
+            core::arch::asm!("isb", options(nomem, nostack));
+        }
     }
 
     pub fn inject_fiq(&mut self) {
         self.pending_fiq = true;
-        // TODO: achieve inject_fiq
+        let hcr = read_hcr_el2();
+        write_hcr_el2(hcr | HCR_EL2_VF);
+
+        unsafe{
+            core::arch::asm!("isb", options(nomem, nostack));
+        }
     }
 
     #[inline]

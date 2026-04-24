@@ -88,8 +88,8 @@ pub fn read_spsr_el2() -> u64 {
 
 #[inline]
 pub fn configure_hcr_el2_for_guest() {
-    // Identity map 128MB of RAM starting from 0x4000_0000 so the Guest can run in-place
-    super::mmu_s2::init_stage2(0x4028_0000, 0x0200_0000); 
+    // Identity map 128MB of RAM starting from 0x4400_0000 so the Guest can run in-place
+    super::mmu_s2::init_stage2(0x4400_0000, 0x1000_0000); 
     HCR_EL2.write(
         HCR_EL2::VM::Enable
             + HCR_EL2::RW::EL1AArch64
