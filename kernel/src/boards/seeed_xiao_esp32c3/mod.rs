@@ -145,9 +145,25 @@ crate::define_peripheral! {
      blueos_driver::uart::esp32_usb_serial::Esp32UsbSerial::new()),
     (intc, blueos_driver::interrupt_controller::esp32_intc::Esp32Intc,
      blueos_driver::interrupt_controller::esp32_intc::Esp32Intc::new(0x600c_2000)),
+    (spi2, blueos_driver::spi::esp32_spi2::Esp32Spi2,
+     blueos_driver::spi::esp32_spi2::Esp32Spi2::new()),
 }
 
 crate::define_pin_states!(None);
+
+#[cfg(fatfs)]
+pub const BLOCK_STORAGE_DEVICE_NAME: &str = "flash-storage";
+#[cfg(fatfs)]
+pub const BLOCK_STORAGE_MOUNT_POINT: &str = "data";
+
+#[cfg(enable_block)]
+pub(crate) fn init_block_devices() {
+    use crate::devices::{spi_core::block_spi::BlockSpi, storage::spi_flash};
+
+    let spi2 = get_device!(spi2);
+    let spi_bus = BlockSpi::new(spi2).expect("Failed to configure SPI2 for flash");
+    spi_flash::init_spi_flash(spi_bus).expect("SPI flash initialization failed");
+}
 
 #[inline(always)]
 pub(crate) fn send_ipi(_hart: usize) {}

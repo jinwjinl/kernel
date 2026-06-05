@@ -26,7 +26,7 @@ use core::{
 use embedded_io::ErrorKind;
 use libc::*;
 use spin::{Once, RwLock as SpinRwLock};
-#[cfg(virtio)]
+#[cfg(enable_block)]
 pub mod block;
 pub mod bus;
 pub mod clock;
@@ -36,6 +36,10 @@ pub mod i2c_core;
 #[cfg(enable_net)]
 pub(crate) mod net;
 mod null;
+#[cfg(enable_block)]
+pub mod spi_core;
+#[cfg(enable_block)]
+pub mod storage;
 pub mod tty;
 #[cfg(virtio)]
 pub mod virtio;
