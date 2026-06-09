@@ -537,9 +537,9 @@ impl Configuration<SpiConfig> for Esp32Spi2 {
         // Clock divider
         self.configure_clock(config.baudrate)?;
 
-        // CS0 enabled, others disabled; CS not kept active between transactions
+        // All HW CS lines disabled; CS managed by software GPIO via ExclusiveDevice
         regs.misc.modify(
-            MISC::CS0_DIS.val(0)
+            MISC::CS0_DIS.val(1)
                 + MISC::CS1_DIS.val(1)
                 + MISC::CS2_DIS.val(1)
                 + MISC::CS3_DIS.val(1)

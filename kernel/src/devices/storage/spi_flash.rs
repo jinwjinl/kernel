@@ -242,6 +242,7 @@ mod tests {
     use super::*;
     use crate::devices::block::{Block, BlockDriverOps, BlockError, ErrorType};
     use alloc::sync::Arc;
+    use blueos_test_macro::test;
     use core::cell::UnsafeCell;
     use embedded_hal::spi::{ErrorKind, Operation, SpiDevice};
 
@@ -449,14 +450,14 @@ mod tests {
         with_shared(&shared, |s| {
             // read_erase_block: 4096 bytes of zeros
             s.read_queue.push(alloc::vec![0u8; FLASH_ERASE_SIZE]);
-            // After write_enable: status with WEL bit (0x02)
+            // sector_erase: write_enable status (WEL=0x02), wait_busy (0x00)
             s.read_queue.push(alloc::vec![0x02]);
-            // After sector_erase: wait_busy status (0x00 = not busy)
             s.read_queue.push(alloc::vec![0x00]);
-            // page_program write_enable: status with WEL bit (0x02)
-            s.read_queue.push(alloc::vec![0x02]);
-            // page_program wait_busy: status (0x00)
-            s.read_queue.push(alloc::vec![0x00]);
+            // 16 page_programs: each needs write_enable (0x02) + wait_busy (0x00)
+            for _ in 0..PAGES_PER_ERASE_BLOCK {
+                s.read_queue.push(alloc::vec![0x02]);
+                s.read_queue.push(alloc::vec![0x00]);
+            }
         });
 
         driver.write_blocks(0, &write_data).unwrap();
@@ -474,11 +475,17 @@ mod tests {
 
         // Write to block 0 — caches erase block 0
         with_shared(&shared, |s| {
+            // read_erase_block 0: 4096 bytes of zeros
             s.read_queue.push(alloc::vec![0u8; FLASH_ERASE_SIZE]);
-            // For flush: write_enable + wait_busy responses
-            s.read_queue.push(alloc::vec![0x02]); // WEL
-            s.read_queue.push(alloc::vec![0x00]); // not busy
-                                                  // For new read_erase_block
+            // flush: sector_erase write_enable (0x02) + wait_busy (0x00)
+            s.read_queue.push(alloc::vec![0x02]);
+            s.read_queue.push(alloc::vec![0x00]);
+            // flush: 16 page_programs, each write_enable (0x02) + wait_busy (0x00)
+            for _ in 0..PAGES_PER_ERASE_BLOCK {
+                s.read_queue.push(alloc::vec![0x02]);
+                s.read_queue.push(alloc::vec![0x00]);
+            }
+            // new read_erase_block 1: 4096 bytes of 0xFF
             s.read_queue.push(alloc::vec![0xFF; FLASH_ERASE_SIZE]);
         });
 

@@ -237,6 +237,7 @@ mod tests {
     // Emballoc is for correctness reference.
     //static ALLOCATOR: emballoc::Allocator<{ EMBALLOC_SIZE }> = emballoc::Allocator::new();
 
+    #[cfg(not(test))]
     #[panic_handler]
     fn oops(info: &PanicInfo) -> ! {
         let _guard = DisableInterruptGuard::new();
@@ -265,6 +266,13 @@ mod tests {
                 mem_info.max_used
             );
         }
+        loop {}
+    }
+
+    #[cfg(test)]
+    #[panic_handler]
+    fn test_panic(info: &PanicInfo) -> ! {
+        semihosting::println!("Oops: {}", info.message());
         loop {}
     }
 

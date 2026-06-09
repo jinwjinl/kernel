@@ -51,7 +51,7 @@ pub struct SpiConfig {
     pub phase: SpiPhase,
     pub polarity: SpiPolarity,
     pub bit_order: SpiBitOrder,
-    pub cs_pin: Option<u8>,
+    pub cs_pin: Option<u8>, // Unused — CS managed by ExclusiveDevice via GPIO OutputPin
 }
 
 impl SpiConfig {

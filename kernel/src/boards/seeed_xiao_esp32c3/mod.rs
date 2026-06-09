@@ -149,7 +149,7 @@ crate::define_peripheral! {
      blueos_driver::spi::esp32_spi2::Esp32Spi2::new()),
 }
 
-crate::define_pin_states!(None);
+// Pin states are configured directly in init_block_devices() using Esp32IoMuxPinctrl
 
 #[cfg(fatfs)]
 pub const BLOCK_STORAGE_DEVICE_NAME: &str = "flash-storage";
@@ -158,11 +158,33 @@ pub const BLOCK_STORAGE_MOUNT_POINT: &str = "data";
 
 #[cfg(enable_block)]
 pub(crate) fn init_block_devices() {
-    use crate::devices::{spi_core::block_spi::BlockSpi, storage::spi_flash};
+    use crate::devices::{spi_core::block_spi::BlockSpiBus, storage::spi_flash};
+    use blueos_driver::gpio::esp32_gpio::{Esp32GpioOutputPin, Esp32IoMuxPinctrl};
+    use blueos_hal::pinctrl::AlterFuncPin;
+    use embedded_hal_bus::spi::ExclusiveDevice;
+
+    // Configure SPI2 pins via IO_MUX + GPIO Matrix
+    // Seeed XIAO ESP32-C3: SCK=GPIO8, MISO=GPIO9, MOSI=GPIO10, CS=GPIO5
+    const PIN_STATES: [Esp32IoMuxPinctrl; 4] = [
+        // SCK (GPIO8) — SPI2 clock output via GPIO Matrix (FSPICLK_OUT_IDX=63)
+        Esp32IoMuxPinctrl::new(8, 1, false, false, false, 2, Some(63), None, false),
+        // MISO (GPIO9) — SPI2 data input via GPIO Matrix (FSPIQ_IN_IDX=64)
+        Esp32IoMuxPinctrl::new(9, 1, true, false, false, 2, None, Some(64), false),
+        // MOSI (GPIO10) — SPI2 data output via GPIO Matrix (FSPID_OUT_IDX=65)
+        Esp32IoMuxPinctrl::new(10, 1, false, false, false, 2, Some(65), None, false),
+        // CS (GPIO5) — software-controlled via GPIO output (FSPICS0_OUT_IDX=68)
+        Esp32IoMuxPinctrl::new(5, 1, false, true, false, 2, Some(68), None, true),
+    ];
+    for pin in PIN_STATES {
+        pin.init();
+    }
 
     let spi2 = get_device!(spi2);
-    let spi_bus = BlockSpi::new(spi2).expect("Failed to configure SPI2 for flash");
-    spi_flash::init_spi_flash(spi_bus).expect("SPI flash initialization failed");
+    let bus = BlockSpiBus::new(spi2).expect("Failed to configure SPI2 for flash");
+    let cs = Esp32GpioOutputPin::<5>::new();
+    let spi_dev = ExclusiveDevice::new(bus, cs, crate::sync::KernelDelay)
+        .expect("Failed to create SPI flash device");
+    spi_flash::init_spi_flash(spi_dev).expect("SPI flash initialization failed");
 }
 
 #[inline(always)]

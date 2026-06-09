@@ -280,6 +280,7 @@ fn addr_bytes(addr: u32) -> Result<[u8; 3], FlashError> {
 mod tests {
     use super::*;
     use alloc::sync::Arc;
+    use blueos_test_macro::test;
     use core::cell::UnsafeCell;
 
     /// Mock SPI device for testing SpiFlashCmd
