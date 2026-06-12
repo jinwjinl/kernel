@@ -111,18 +111,21 @@ register_bitfields! [
     ],
 ];
 
-// ─── GPIO controller registers (from gpio_reg.h) ─────────────────────────
-// Key offsets relative to GPIO base (0x60004000):
-//   0x00: bt_select (unused)
-//   0x04: out          — output value (bits 0-25 for GPIO0-21)
-//   0x08: out_w1ts     — atomic write-1-to-set output
-//   0x0C: out_w1tc     — atomic write-1-to-clear output
-//   0x20: enable       — output enable (bits 0-25)
-//   0x24: enable_w1ts  — atomic write-1-to-set enable
-//   0x28: enable_w1tc  — atomic write-1-to-clear enable
+register_bitfields! [
+    u32,
+
+    pub GpioOut [
+        DATA OFFSET(0) NUMBITS(26) [],
+    ],
+    pub GpioEnable [
+        DATA OFFSET(0) NUMBITS(26) [],
+    ],
+];
+
+// ─── GPIO controller registers ──────────────────────────────────────────
 
 register_structs! {
-    pub GpioRegisters {
+    GpioRegisters {
         (0x000 => bt_select: ReadWrite<u32>),
         (0x004 => out: ReadWrite<u32, GpioOut::Register>),
         (0x008 => out_w1ts: ReadWrite<u32, GpioOut::Register>),
@@ -132,19 +135,8 @@ register_structs! {
         (0x024 => enable_w1ts: ReadWrite<u32, GpioEnable::Register>),
         (0x028 => enable_w1tc: ReadWrite<u32, GpioEnable::Register>),
         (0x02C => @END),
-    },
+    }
 }
-
-register_bitfields! [
-    u32,
-
-    pub GpioOut [
-        DATA OFFSET(0) NUMBITS(26) [],   // GPIO0-25 output value
-    ],
-    pub GpioEnable [
-        DATA OFFSET(0) NUMBITS(26) [],   // GPIO0-25 output enable
-    ],
-];
 
 // ─── GPIO Matrix output function selection (from gpio_reg.h) ─────────────
 // GPIO_FUNCx_OUT_SEL_CFG_REG at offset 0x554 + 4*x
@@ -188,7 +180,7 @@ register_bitfields! [
 
 // ─── Helper: write IO_MUX register for a GPIO pin ────────────────────────
 
-fn write_io_mux(pin: u8, mcu_sel: u8, ie: bool, pu: bool, pd: bool, drv: u8) {
+fn write_io_mux(pin: u8, mcu_sel: u32, ie: bool, pu: bool, pd: bool, drv: u32) {
     let offset = IO_MUX_OFFSETS[pin as usize];
     let addr = IO_MUX_BASE + offset as usize;
     let reg = unsafe { &*(addr as *const ReadWrite<u32, IoMuxFields::Register>) };
@@ -204,7 +196,7 @@ fn write_io_mux(pin: u8, mcu_sel: u8, ie: bool, pu: bool, pd: bool, drv: u8) {
 // ─── Helper: route peripheral output signal to a GPIO pin ────────────────
 // Writes GPIO_FUNCx_OUT_SEL_CFG_REG to connect signal_idx to GPIO pin.
 
-fn route_signal_out(pin: u8, signal_idx: u32, oen_sel: u8) {
+fn route_signal_out(pin: u8, signal_idx: u32, oen_sel: u32) {
     let offset = 0x554 + 4 * pin as usize;
     let addr = 0x60004000 + offset;
     let reg = unsafe { &*(addr as *const ReadWrite<u32, FuncOutSelCfg::Register>) };
@@ -219,7 +211,7 @@ fn route_signal_out(pin: u8, signal_idx: u32, oen_sel: u8) {
 // ─── Helper: route GPIO pin to peripheral input signal ───────────────────
 // Writes GPIO_FUNCx_IN_SEL_CFG_REG to connect GPIO pin to signal_idx.
 
-fn route_signal_in(signal_idx: u32, pin: u8) {
+fn route_signal_in(signal_idx: u32, pin: u32) {
     let offset = 0x154 + 4 * signal_idx as usize;
     let addr = 0x60004000 + offset;
     let reg = unsafe { &*(addr as *const ReadWrite<u32, FuncInSelCfg::Register>) };
@@ -241,11 +233,11 @@ fn route_signal_in(signal_idx: u32, pin: u8) {
 /// so the GPIO Matrix can take over signal routing.
 pub struct Esp32IoMuxPinctrl {
     pin: u8,
-    mcu_sel: u8,
+    mcu_sel: u32,
     ie: bool,
     pu: bool,
     pd: bool,
-    drv: u8,
+    drv: u32,
     out_signal: Option<u32>,
     in_signal: Option<u32>,
     gpio_output: bool,
@@ -254,11 +246,11 @@ pub struct Esp32IoMuxPinctrl {
 impl Esp32IoMuxPinctrl {
     pub const fn new(
         pin: u8,
-        mcu_sel: u8,
+        mcu_sel: u32,
         ie: bool,
         pu: bool,
         pd: bool,
-        drv: u8,
+        drv: u32,
         out_signal: Option<u32>,
         in_signal: Option<u32>,
         gpio_output: bool,
@@ -286,16 +278,16 @@ impl AlterFuncPin for Esp32IoMuxPinctrl {
         if let Some(signal_idx) = self.out_signal {
             if self.gpio_output {
                 // Software-controlled pin (e.g., CS): OEN_SEL=1 (GPIO_ENABLE controls)
-                route_signal_out(self.pin, signal_idx, 1);
+                route_signal_out(self.pin, signal_idx, 1u32);
             } else {
                 // Peripheral-controlled pin (CLK, MOSI): OEN_SEL=0 (peripheral controls)
-                route_signal_out(self.pin, signal_idx, 0);
+                route_signal_out(self.pin, signal_idx, 0u32);
             }
         }
 
         // 3. Route this GPIO pin to peripheral input signal via GPIO Matrix
         if let Some(signal_idx) = self.in_signal {
-            route_signal_in(signal_idx, self.pin);
+            route_signal_in(signal_idx, self.pin as u32);
         }
 
         // 4. Enable GPIO output for software-controlled pins (CS)

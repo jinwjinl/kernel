@@ -149,7 +149,7 @@ crate::define_peripheral! {
      blueos_driver::spi::esp32_spi2::Esp32Spi2::new()),
 }
 
-// Pin states are configured directly in init_block_devices() using Esp32IoMuxPinctrl
+crate::define_pin_states!(None);
 
 #[cfg(fatfs)]
 pub const BLOCK_STORAGE_DEVICE_NAME: &str = "flash-storage";
