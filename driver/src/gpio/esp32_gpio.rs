@@ -290,12 +290,14 @@ impl AlterFuncPin for Esp32IoMuxPinctrl {
             route_signal_in(signal_idx, self.pin as u32);
         }
 
-        // 4. Enable GPIO output for software-controlled pins (CS)
+        // 4. Enable GPIO output for software-controlled pins (CS).
+        // Order matters: pre-set the output latch HIGH *before* enabling output,
+        // so the pin is driven high the instant output turns on — no low glitch
+        // on CS during the enable moment.
         if self.gpio_output {
             let gpio_regs = &*GPIO_BASE;
-            gpio_regs.enable_w1ts.write(GpioEnable::DATA.val(1 << self.pin));
-            // Drive CS HIGH initially (deasserted)
             gpio_regs.out_w1ts.write(GpioOut::DATA.val(1 << self.pin));
+            gpio_regs.enable_w1ts.write(GpioEnable::DATA.val(1 << self.pin));
         }
     }
 }

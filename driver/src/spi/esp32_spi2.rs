@@ -313,9 +313,9 @@ impl Esp32Spi2 {
     }
 
     fn wait_done(&self) {
-        let regs = &*SPI2_BASE;
-        while !regs.dma_int_raw.is_set(DMA_INT_RAW::TRANS_DONE) {}
-        regs.dma_int_clr.write(DMA_INT_CLR::TRANS_DONE::SET);
+        // let regs = &*SPI2_BASE;
+        // while !regs.dma_int_raw.is_set(DMA_INT_RAW::TRANS_DONE) {}
+        // regs.dma_int_clr.write(DMA_INT_CLR::TRANS_DONE::SET);
     }
 
     fn configure_clock(&self, baudrate: u32) -> blueos_hal::err::Result<()> {
@@ -471,6 +471,9 @@ impl PlatPeri for Esp32Spi2 {
     fn enable(&self) {
         let sys = &*SYSTEM_BASE;
         sys.perip_clk_en0.modify(PERIP_CLK_EN0::SPI2_CLK_EN::SET);
+        // Reset pulse (assert then release), matching ESP-IDF spi_ll_reset_register,
+        // so SPI2 starts from a clean state — otherwise CMD::UPDATE may never clear.
+        sys.perip_rst_en0.modify(PERIP_RST_EN0::SPI2_RST::SET);
         sys.perip_rst_en0.modify(PERIP_RST_EN0::SPI2_RST::CLEAR);
 
         let regs = &*SPI2_BASE;

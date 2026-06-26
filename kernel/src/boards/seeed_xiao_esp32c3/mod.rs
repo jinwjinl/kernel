@@ -151,9 +151,10 @@ crate::define_peripheral! {
 
 crate::define_pin_states!(None);
 
-#[cfg(fatfs)]
+/// Block device name registered with DeviceManager and looked up by the VFS.
+/// Single source of truth: init_spi_flash registers under this name, and
+/// FatFileSystem::new looks it up — both read the same constant.
 pub const BLOCK_STORAGE_DEVICE_NAME: &str = "flash-storage";
-#[cfg(fatfs)]
 pub const BLOCK_STORAGE_MOUNT_POINT: &str = "data";
 
 #[cfg(enable_block)]
@@ -172,8 +173,8 @@ pub(crate) fn init_block_devices() {
         Esp32IoMuxPinctrl::new(9, 1, true, false, false, 2, None, Some(64), false),
         // MOSI (GPIO10) — SPI2 data output via GPIO Matrix (FSPID_OUT_IDX=65)
         Esp32IoMuxPinctrl::new(10, 1, false, false, false, 2, Some(65), None, false),
-        // CS (GPIO5) — software-controlled via GPIO output (FSPICS0_OUT_IDX=68)
-        Esp32IoMuxPinctrl::new(5, 1, false, true, false, 2, Some(68), None, true),
+        // CS (GPIO5) — software-controlled GPIO only (no FSPICS0 matrix routing)
+        Esp32IoMuxPinctrl::new(5, 1, false, true, false, 2, None, None, true),
     ];
     for pin in PIN_STATES {
         pin.init();
@@ -184,7 +185,8 @@ pub(crate) fn init_block_devices() {
     let cs = Esp32GpioOutputPin::<5>::new();
     let spi_dev = ExclusiveDevice::new(bus, cs, crate::sync::KernelDelay)
         .expect("Failed to create SPI flash device");
-    spi_flash::init_spi_flash(spi_dev).expect("SPI flash initialization failed");
+    spi_flash::init_spi_flash(spi_dev, BLOCK_STORAGE_DEVICE_NAME)
+        .expect("SPI flash initialization failed");
 }
 
 #[inline(always)]

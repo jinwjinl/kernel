@@ -35,9 +35,6 @@ use crate::{
 /// Flash block device sector size (512 bytes)
 const FLASH_SECTOR_SIZE: u16 = 512;
 
-/// Flash block device name registered with DeviceManager
-const FLASH_STORAGE_NAME: &str = "flash-storage";
-
 /// Erase block size (4KB) — matches sector_erase (0x20) granularity
 const FLASH_ERASE_SIZE: usize = 4096;
 
@@ -193,8 +190,9 @@ impl<SPI: SpiDevice<u8> + Send + Sync> BlockDriverOps for SpiFlashBlockDriver<SP
 /// Initialize the SPI NOR Flash block device
 ///
 /// Reads the JEDEC ID, determines capacity from the density byte,
-/// creates the FTL block driver, and registers it with DeviceManager.
-pub fn init_spi_flash<SPI>(spi: SPI) -> Result<(), ErrorKind>
+/// creates the FTL block driver, and registers it with DeviceManager
+/// under `name` (the same name the VFS will later look up).
+pub fn init_spi_flash<SPI>(spi: SPI, name: &str) -> Result<(), ErrorKind>
 where
     SPI: SpiDevice<u8> + Send + Sync + 'static,
 {
@@ -219,12 +217,12 @@ where
     let block_driver = SpiFlashBlockDriver::new(flash_cmd, capacity_bytes);
 
     let block = Block::<BlockError<FlashBlockError>, { FLASH_SECTOR_SIZE as usize }>::new(
-        FLASH_STORAGE_NAME,
+        name,
         Arc::new(SpinLock::new(block_driver)),
     );
 
     DeviceManager::get()
-        .register_device(String::from(FLASH_STORAGE_NAME), Arc::new(block))
+        .register_device(String::from(name), Arc::new(block))
         .map_err(|_| ErrorKind::AlreadyExists)?;
 
     Ok(())

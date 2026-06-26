@@ -102,15 +102,3 @@ macro_rules! define_bus {
         pub use get_bus_devices;
     };
 }
-
-#[cfg(enable_block)]
-pub(crate) fn init_block_devices() {
-    // Default empty implementation. Boards override this via current_board_mod!
-    // pub use * which re-exports their board-specific definition.
-}
-
-#[cfg(fatfs)]
-pub const BLOCK_STORAGE_DEVICE_NAME: &str = "block-storage";
-
-#[cfg(fatfs)]
-pub const BLOCK_STORAGE_MOUNT_POINT: &str = "data";
