@@ -175,6 +175,7 @@ register_bitfields! [
     pub FuncInSelCfg [
         IN_SEL     OFFSET(0) NUMBITS(5) [],   // GPIO pin number for input
         IN_INV_SEL OFFSET(5) NUMBITS(1) [],   // Invert input
+        SEL        OFFSET(6) NUMBITS(1) [],   // 1 = route via GPIO Matrix (do not bypass), 0 = bypass
     ],
 ];
 
@@ -216,8 +217,9 @@ fn route_signal_in(signal_idx: u32, pin: u32) {
     let addr = 0x60004000 + offset;
     let reg = unsafe { &*(addr as *const ReadWrite<u32, FuncInSelCfg::Register>) };
     reg.write(
-        FuncInSelCfg::IN_SEL.val(pin)
-            + FuncInSelCfg::IN_INV_SEL.val(0),
+        FuncInSelCfg::SEL.val(1)
+            + FuncInSelCfg::IN_INV_SEL.val(0)
+            + FuncInSelCfg::IN_SEL.val(pin),
     );
 }
 

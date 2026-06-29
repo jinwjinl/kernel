@@ -36,6 +36,9 @@ const SYSTEM_BASE: StaticRef<SystemRegisters> =
 const APB_CLK_HZ: u32 = 80_000_000;
 const SPI2_DATA_BUF_SIZE: usize = 64;
 
+// Pad byte for full-duplex reads where read length exceeds write length.
+const EMPTY_WRITE_PAD: u8 = 0x00;
+
 register_bitfields! [
     u32,
 
@@ -306,9 +309,39 @@ impl Esp32Spi2 {
         while regs.cmd.is_set(CMD::UPDATE) {}
     }
 
+    // AFIFO reset must be a SET-then-CLEAR pulse; leaving the bit set keeps the
+    // FIFO held in reset and corrupts subsequent transfers on real hardware.
+    fn reset_tx_fifo(&self) {
+        let regs = &*SPI2_BASE;
+        regs.dma_conf.modify(DMA_CONF::BUF_AFIFO_RST::SET);
+        regs.dma_conf.modify(DMA_CONF::BUF_AFIFO_RST::CLEAR);
+    }
+
+    fn reset_rx_fifo(&self) {
+        let regs = &*SPI2_BASE;
+        regs.dma_conf.modify(DMA_CONF::RX_AFIFO_RST::SET);
+        regs.dma_conf.modify(DMA_CONF::RX_AFIFO_RST::CLEAR);
+    }
+
+    fn reset_tx_rx_fifo(&self) {
+        let regs = &*SPI2_BASE;
+        regs.dma_conf
+            .modify(DMA_CONF::BUF_AFIFO_RST::SET + DMA_CONF::RX_AFIFO_RST::SET);
+        regs.dma_conf
+            .modify(DMA_CONF::BUF_AFIFO_RST::CLEAR + DMA_CONF::RX_AFIFO_RST::CLEAR);
+    }
+
     fn start_transfer(&self) {
         let regs = &*SPI2_BASE;
-        regs.cmd.write(CMD::USR.val(1));
+        // Sync config registers into the shadow registers before each transfer.
+        // Matches esp-hal start_operation: update() first.
+        regs.cmd.modify(CMD::UPDATE.val(1));
+        while regs.cmd.is_set(CMD::UPDATE) {}
+        // Clear any pending TRANS_DONE from a previous transfer before starting.
+        regs.dma_int_clr.write(DMA_INT_CLR::TRANS_DONE::SET);
+        // Kick off the user-defined transaction. USR self-clears on completion.
+        // Use modify (not write) so other CMD bits stay untouched.
+        regs.cmd.modify(CMD::USR.val(1));
         while regs.cmd.is_set(CMD::USR) {}
     }
 
@@ -370,9 +403,6 @@ impl Esp32Spi2 {
             return Ok(());
         }
         let regs = &*SPI2_BASE;
-        if data.len() > SPI2_DATA_BUF_SIZE {
-            return Err(blueos_hal::err::HalError::NotSupport);
-        }
 
         regs.user.modify(
             USER::DOUTDIN.val(0)
@@ -382,14 +412,15 @@ impl Esp32Spi2 {
                 + USER::USR_ADDR::CLEAR
                 + USER::USR_DUMMY::CLEAR,
         );
-        regs.ms_dlen
-            .write(MS_DLEN::MS_DATA_BITLEN.val((data.len() as u32 * 8 - 1)));
 
-        self.write_buf(data);
-        regs.dma_conf.write(DMA_CONF::BUF_AFIFO_RST::SET);
-        self.apply_config();
-        self.start_transfer();
-        self.wait_done();
+        for chunk in data.chunks(SPI2_DATA_BUF_SIZE) {
+            self.reset_tx_fifo();
+            regs.ms_dlen
+                .write(MS_DLEN::MS_DATA_BITLEN.val((chunk.len() as u32 * 8 - 1)));
+            self.write_buf(chunk);
+            self.start_transfer();
+            self.wait_done();
+        }
         Ok(())
     }
 
@@ -398,26 +429,29 @@ impl Esp32Spi2 {
             return Ok(());
         }
         let regs = &*SPI2_BASE;
-        if data.len() > SPI2_DATA_BUF_SIZE {
-            return Err(blueos_hal::err::HalError::NotSupport);
-        }
 
+        // Full-duplex dummy read: write 0x00 while reading, so SCLK is driven by
+        // the MOSI phase. Matches esp-hal Driver::read (USR_MOSI+USR_MISO+DOUTDIN).
+        // Half-duplex MISO-only was returning misaligned data on real hardware.
         regs.user.modify(
-            USER::DOUTDIN.val(0)
-                + USER::USR_MOSI::CLEAR
+            USER::DOUTDIN.val(1)
+                + USER::USR_MOSI::SET
                 + USER::USR_MISO::SET
                 + USER::USR_COMMAND::CLEAR
                 + USER::USR_ADDR::CLEAR
                 + USER::USR_DUMMY::CLEAR,
         );
-        regs.ms_dlen
-            .write(MS_DLEN::MS_DATA_BITLEN.val((data.len() as u32 * 8 - 1)));
 
-        regs.dma_conf.write(DMA_CONF::RX_AFIFO_RST::SET);
-        self.apply_config();
-        self.start_transfer();
-        self.wait_done();
-        self.read_buf(data);
+        for chunk in data.chunks_mut(SPI2_DATA_BUF_SIZE) {
+            self.reset_tx_rx_fifo();
+            regs.ms_dlen
+                .write(MS_DLEN::MS_DATA_BITLEN.val((chunk.len() as u32 * 8 - 1)));
+            let dummy = [EMPTY_WRITE_PAD; SPI2_DATA_BUF_SIZE];
+            self.write_buf(&dummy[..chunk.len()]);
+            self.start_transfer();
+            self.wait_done();
+            self.read_buf(chunk);
+        }
         Ok(())
     }
 
@@ -430,10 +464,6 @@ impl Esp32Spi2 {
             return Ok(());
         }
         let regs = &*SPI2_BASE;
-        let len = read.len().max(write.len());
-        if len > SPI2_DATA_BUF_SIZE {
-            return Err(blueos_hal::err::HalError::NotSupport);
-        }
 
         regs.user.modify(
             USER::DOUTDIN.val(1)
@@ -443,26 +473,46 @@ impl Esp32Spi2 {
                 + USER::USR_ADDR::CLEAR
                 + USER::USR_DUMMY::CLEAR,
         );
-        regs.ms_dlen
-            .write(MS_DLEN::MS_DATA_BITLEN.val((len as u32 * 8 - 1)));
 
-        // Zero-fill write buffer up to transfer length, then overlay with actual write data
-        let mut write_buf = [0u8; SPI2_DATA_BUF_SIZE];
-        let effective_len = write.len().min(SPI2_DATA_BUF_SIZE);
-        write_buf[..effective_len].copy_from_slice(&write[..effective_len]);
-        self.write_buf(&write_buf[..len]);
+        // Independent read/write cursors (matches esp-hal Driver::transfer):
+        // each side advances min(FIFO_SIZE, remaining) on its own. When read
+        // exceeds write in a chunk, the write side is padded with EMPTY_WRITE_PAD
+        // so enough SCLK cycles are generated for the read.
+        let mut write_from = 0usize;
+        let mut read_from = 0usize;
+        loop {
+            let write_inc = core::cmp::min(SPI2_DATA_BUF_SIZE, write.len() - write_from);
+            let read_inc = core::cmp::min(SPI2_DATA_BUF_SIZE, read.len() - read_from);
+            if write_inc == 0 && read_inc == 0 {
+                break;
+            }
 
-        regs.dma_conf
-            .write(DMA_CONF::BUF_AFIFO_RST::SET + DMA_CONF::RX_AFIFO_RST::SET);
-        self.apply_config();
-        self.start_transfer();
-        self.wait_done();
+            let this_len = write_inc.max(read_inc);
+            self.reset_tx_rx_fifo();
+            regs.ms_dlen
+                .write(MS_DLEN::MS_DATA_BITLEN.val((this_len as u32 * 8 - 1)));
 
-        // Read all data from buffer, then copy only what the caller requested
-        let mut read_buf = [0u8; SPI2_DATA_BUF_SIZE];
-        self.read_buf(&mut read_buf[..len]);
-        let effective_read = read.len().min(len);
-        read[..effective_read].copy_from_slice(&read_buf[..effective_read]);
+            if write_inc < read_inc {
+                // Read more than we write: pad write side up to read_inc bytes.
+                let mut buf = [EMPTY_WRITE_PAD; SPI2_DATA_BUF_SIZE];
+                buf[..write_inc].copy_from_slice(&write[write_from..][..write_inc]);
+                self.write_buf(&buf[..read_inc]);
+            } else {
+                self.write_buf(&write[write_from..][..write_inc]);
+            }
+
+            self.start_transfer();
+            self.wait_done();
+
+            if read_inc > 0 {
+                let mut tmp = [0u8; SPI2_DATA_BUF_SIZE];
+                self.read_buf(&mut tmp[..read_inc]);
+                read[read_from..][..read_inc].copy_from_slice(&tmp[..read_inc]);
+            }
+
+            write_from += write_inc;
+            read_from += read_inc;
+        }
         Ok(())
     }
 }
@@ -509,8 +559,7 @@ impl Configuration<SpiConfig> for Esp32Spi2 {
         // No DMA, clear FIFOs
         regs.dma_conf
             .write(DMA_CONF::DMA_RX_ENA::CLEAR + DMA_CONF::DMA_TX_ENA::CLEAR);
-        regs.dma_conf
-            .write(DMA_CONF::RX_AFIFO_RST::SET + DMA_CONF::BUF_AFIFO_RST::SET);
+        self.reset_tx_rx_fifo();
 
         // SPI mode from phase + polarity
         let ck_idle_edge = match config.polarity {
@@ -551,7 +600,6 @@ impl Configuration<SpiConfig> for Esp32Spi2 {
                 + MISC::CS_KEEP_ACTIVE::CLEAR,
         );
 
-        self.apply_config();
         Ok(())
     }
 }
