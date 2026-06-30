@@ -99,6 +99,9 @@ impl FatFileSystem {
                     );
                     fatfs::format_volume(&mut storage, format_opts)
                         .expect("[FatFileSystem] Format volume fail.");
+                    storage
+                        .flush()
+                        .expect("[FatFileSystem] Flush after format fail.");
                     fatfs::FileSystem::new(storage, fatfs::FsOptions::new())
                         .expect("[FatFileSystem] Failed to construct internal fs again")
                 }

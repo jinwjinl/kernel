@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{arch, kprintln, scheduler, sync::SpinLock, thread::Thread, time};
+use crate::{arch, kearly_println, kprintln, scheduler, sync::SpinLock, thread::Thread, time};
 use log::{LevelFilter, Metadata, Record};
 
 static LOGGER_MUTEX: SpinLock<()> = SpinLock::new(());
@@ -52,6 +52,20 @@ impl log::Log for Logger {
         let timestamp = time::now().as_millis();
         let tid = scheduler::current_thread_id();
         let cpu = arch::current_cpu_id();
+
+        if !scheduler::is_schedule_ready() {
+            #[cfg(not(test))]
+            kearly_println!(
+                "[T:{:09} C:{} TH:0x{:x}][{}] {} ",
+                timestamp,
+                cpu,
+                tid,
+                record.level(),
+                record.args()
+            );
+            return;
+        }
+        
         #[cfg(not(test))]
         kprintln!(
             "[T:{:09} C:{} TH:0x{:x}][{}] {} ",
