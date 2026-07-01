@@ -553,7 +553,12 @@ impl InodeOps for FatInode {
     }
 
     fn close(&self) -> Result<(), Error> {
-        Ok(())
+        // Flush dirty data on close so file contents persist. Non-regular
+        // inodes have nothing to flush.
+        if self.type_() != InodeFileType::Regular {
+            return Ok(());
+        }
+        self.fsync()
     }
 
     fn read_at(&self, offset: usize, buf: &mut [u8], _nonblock: bool) -> Result<usize, Error> {

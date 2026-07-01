@@ -42,7 +42,19 @@ impl DelayNs for KernelDelay {
         }
         let ticks = blueos_kconfig::CONFIG_TICKS_PER_SECOND as u32 * ns / 1_000_000_000;
         if ticks == 0 {
-            scheduler::yield_me();
+            // yield_me() is a no-op in single-task shell; spin a real delay so
+            // flash wait_busy gets a real per-iteration budget.
+            #[cfg(target_arch = "riscv32")]
+            {
+                let spins = (ns as u64).saturating_mul(160) / 1_000;
+                for _ in 0..spins {
+                    core::hint::spin_loop();
+                }
+            }
+            #[cfg(not(target_arch = "riscv32"))]
+            {
+                scheduler::yield_me();
+            }
         } else {
             scheduler::suspend_me_for::<()>(Tick(ticks as usize), None);
         }
