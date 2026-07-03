@@ -156,16 +156,30 @@ impl Serial {
     }
 
     pub fn read_bytes(&self, bytes: &mut [u8], is_nonblocking: bool) -> Result<usize, ErrorKind> {
+        // POSIX `read` semantics: return as soon as at least one byte is available
+        // (a "partial read"), rather than blocking until `bytes` is completely filled.
+        // Filling the whole buffer deadlocks interactive line/character input, where
+        // bytes arrive one at a time and may never fill a 512-byte request.
         let mut nbytes = 0;
         for byte in bytes {
+            // Non-blocking path: drain whatever is already in the RX FIFO without waiting.
+            if is_nonblocking {
+                match self.get_char() {
+                    Some(c) => {
+                        *byte = c;
+                        nbytes += 1;
+                    }
+                    None => break,
+                }
+                continue;
+            }
+
+            // Blocking path: wait until at least one byte is available, then read it.
             loop {
                 if let Some(c) = self.get_char() {
                     *byte = c;
                     nbytes += 1;
                     break;
-                }
-                if is_nonblocking {
-                    return Ok(nbytes);
                 }
 
                 if !is_schedule_ready() {
@@ -188,6 +202,10 @@ impl Serial {
                     Err(_) => return Err(ErrorKind::Other),
                 }
             }
+
+            // Return as soon as the first byte is read so the caller (e.g. the TTY
+            // echo loop) can process it; remaining bytes are read on the next call.
+            break;
         }
         Ok(nbytes)
     }
