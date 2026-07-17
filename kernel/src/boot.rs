@@ -153,6 +153,12 @@ extern "C" fn init() {
     }
     #[cfg(spi_core)]
     crate::boards::init_spi_bus();
+    #[cfg(soc_esp32c3)]
+    {
+        if let Err(e) = crate::drivers::flash::init_internal_flash() {
+            log::warn!("Failed to init internal flash: {:?}", e);
+        }
+    }
     #[cfg(enable_vfs)]
     init_vfs();
     #[cfg(soc_esp32c3)]

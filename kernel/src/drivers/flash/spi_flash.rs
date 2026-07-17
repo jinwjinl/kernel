@@ -15,10 +15,8 @@
 //! SPI NOR Flash FTL block driver adapter.
 
 use alloc::{string::String, sync::Arc, vec, vec::Vec};
-use blueos_hal::gpio::OutputPin;
-use blueos_hal::spi::Spi;
-use blueos_hal::PlatPeri;
 use blueos_driver::spi::SpiConfig;
+use blueos_hal::{gpio::OutputPin, spi::Spi, PlatPeri};
 use core::cmp::min;
 use embedded_hal::spi::SpiDevice;
 use embedded_io::ErrorKind;
@@ -30,7 +28,10 @@ use crate::{
         spi_core::block_spi::BlockSpi,
         DeviceData, DeviceManager,
     },
-    drivers::{flash::spi_flash_cmd::{FlashError, SpiFlashCmd}, DriverModule, InitDriver},
+    drivers::{
+        flash::spi_flash_cmd::{FlashError, SpiFlashCmd},
+        DriverModule, InitDriver,
+    },
     sync::SpinLock,
 };
 
@@ -226,9 +227,7 @@ where
     fn init(self, bus: &Bus<BlockSpi<T, G>>) -> crate::drivers::Result<Self::Data> {
         let mut flash_cmd = SpiFlashCmd::new(bus.intf.clone());
 
-        let jedec_id = flash_cmd
-            .jedec_id()
-            .map_err(|_| crate::error::code::EIO)?;
+        let jedec_id = flash_cmd.jedec_id().map_err(|_| crate::error::code::EIO)?;
         let density_byte = (jedec_id & 0xFF) as u8;
         let capacity_bytes: u64 = if density_byte < 31 {
             (1u32 << density_byte) as u64

@@ -7,6 +7,15 @@
 OUTPUT_ARCH("riscv")
 ENTRY(_start)
 
+/* Pull in the ESP32-C3 mask-ROM symbol addresses (esp_rom_spiflash_*,
+ * Cache_*) referenced by drivers/flash/esp32_rom.rs. We INCLUDE only
+ * esp32c3.rom.ld, NOT the full rom-functions.x: the latter also pulls
+ * additional.ld whose EXTERN(__mktime/__strnlen/__atoi) name symbols that
+ * are undefined even on target. esp32c3.rom.ld alone PROVIDEs every symbol
+ * we use as non-forcing absolute addresses. Resolved via the -L native
+ * search path for .../esp-rom-sys-0.1.4/ld/esp32c3 set in board_rustflags. */
+INCLUDE "rom/esp32c3.rom.ld"
+
 MEMORY
 {
     /*
