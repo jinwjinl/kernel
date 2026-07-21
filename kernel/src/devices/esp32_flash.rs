@@ -207,7 +207,7 @@ impl Esp32FlashDevice {
         Ok(())
     }
 
-    /// Sequential write with 4-byte tail cache (§19).
+    /// Sequential write with 4-byte tail cache.
     fn write_data(&self, pos: u64, buf: &[u8]) -> Result<usize, ErrorKind> {
         if buf.is_empty() {
             return Ok(0);
@@ -379,7 +379,6 @@ fn map_flash_err(e: EspFlashError) -> ErrorKind {
     }
 }
 
-/// Register `/dev/esp32-flash0` (§26).
 pub fn init_esp32_flash_device() -> Result<(), ErrorKind> {
     let region = InternalFlashRegion::new(LOADABLE_IMAGE_OFFSET, LOADABLE_IMAGE_SIZE);
     let capacity = with_internal_flash(|flash| Ok(flash.capacity())).map_err(map_flash_err)?;
