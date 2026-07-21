@@ -39,6 +39,8 @@ pub(crate) mod net;
 mod null;
 #[cfg(enable_block)]
 pub mod spi_core;
+#[cfg(soc_esp32c3)]
+pub mod esp32_flash;
 pub mod tty;
 #[cfg(virtio)]
 pub mod virtio;

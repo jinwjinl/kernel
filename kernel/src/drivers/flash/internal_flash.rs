@@ -16,14 +16,14 @@
 //! `write()` does NOT auto-erase; callers must `erase_region` first.
 
 use super::esp32_rom;
+use crate::sync::SpinLock;
 
 pub const ESP_FLASH_SECTOR_SIZE: usize = 4096;
 pub const ESP_FLASH_WORD_SIZE: usize = 4;
-pub const ESP_INTERNAL_FLASH_SIZE: u32 = 4 * 1024 * 1024; // 4 MB
 const ROM_PAGE_SIZE: usize = 256; // NOR page-program granularity
+const ESP_FLASH_READ_CHUNK_SIZE: usize = 1024; // batch read granularity
 
-/// One-shot init called from boot.rs: unlock the flash once. Per-write re-unlock is
-/// not done; a single boot unlock suffices for the raw API.
+/// One-shot boot unlock. Per-write re-unlock is unnecessary for the raw API.
 pub(crate) fn init_internal_flash() -> Result<(), EspFlashError> {
     let r = unsafe { esp32_rom::rom_unlock() };
     if r != esp32_rom::ESP_ROM_SPIFLASH_RESULT_OK {
@@ -37,6 +37,17 @@ pub(crate) fn init_internal_flash() -> Result<(), EspFlashError> {
         chip_size
     );
     Ok(())
+}
+
+/// Cross-thread serialization for flash ops; ROM wrappers only guard one call.
+static INTERNAL_FLASH_LOCK: SpinLock<()> = SpinLock::new(());
+
+pub fn with_internal_flash<R>(
+    operation: impl FnOnce(&mut Esp32c3InternalFlash) -> Result<R, EspFlashError>,
+) -> Result<R, EspFlashError> {
+    let _guard = INTERNAL_FLASH_LOCK.lock();
+    let mut flash = Esp32c3InternalFlash::detect()?;
+    operation(&mut flash)
 }
 
 /// Raw API error type.
@@ -69,6 +80,12 @@ impl Esp32c3InternalFlash {
         Self { capacity }
     }
 
+    /// Construct on demand from the ROM chip size; unlock stays in `init_internal_flash`.
+    pub fn detect() -> Result<Self, EspFlashError> {
+        let size = unsafe { esp32_rom::rom_chip_size() };
+        Ok(Self::new(size))
+    }
+
     pub const fn capacity(&self) -> u32 {
         self.capacity
     }
@@ -84,36 +101,20 @@ impl Esp32c3InternalFlash {
         Ok(())
     }
 
-    /// Read `buf.len()` bytes from `offset`. ROM takes a 4-byte-aligned `*const u32`,
-    /// so an align-1 `&mut [u8]` is staged through a 4-aligned word buffer.
+    /// Read `buf.len()` bytes from `offset`, batched in 1 KiB chunks. ROM takes
+    /// a 4-aligned `*const u32`, so unaligned head/tail are staged through a word buffer.
     pub fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), EspFlashError> {
         self.check_bounds(offset, buf.len())?;
         if buf.is_empty() {
             return Ok(());
         }
-        let aligned = buf.len() & !(ESP_FLASH_WORD_SIZE - 1);
-        if aligned != 0 {
-            let mut scratch: EspAlignedBuffer<ESP_FLASH_WORD_SIZE> = EspAlignedBuffer::new();
-            let mut off = 0usize;
-            while off < aligned {
-                let r = unsafe {
-                    esp32_rom::rom_read(
-                        offset + off as u32,
-                        scratch.0.as_ptr() as *const u32,
-                        ESP_FLASH_WORD_SIZE as u32,
-                    )
-                };
-                rom_result(r)?;
-                buf[off..off + ESP_FLASH_WORD_SIZE].copy_from_slice(&scratch.0);
-                off += ESP_FLASH_WORD_SIZE;
-            }
-        }
-        // Tail (< 4 bytes): read one aligned word, copy the needed bytes.
-        let tail = buf.len() - aligned;
-        if tail != 0 {
-            let tail_off = offset + aligned as u32;
-            let word_off = tail_off & !(ESP_FLASH_WORD_SIZE as u32 - 1);
-            let skip = (tail_off - word_off) as usize;
+
+        // Head: align `offset` down to a word, copy the needed leading bytes.
+        let mut done = 0usize;
+        let head_mis = (offset as usize) & (ESP_FLASH_WORD_SIZE - 1);
+        if head_mis != 0 {
+            let word_off = offset & !(ESP_FLASH_WORD_SIZE as u32 - 1);
+            let head_len = core::cmp::min(ESP_FLASH_WORD_SIZE - head_mis, buf.len());
             let mut scratch: EspAlignedBuffer<ESP_FLASH_WORD_SIZE> = EspAlignedBuffer::new();
             let r = unsafe {
                 esp32_rom::rom_read(
@@ -123,7 +124,46 @@ impl Esp32c3InternalFlash {
                 )
             };
             rom_result(r)?;
-            buf[aligned..].copy_from_slice(&scratch.0[skip..skip + tail]);
+            buf[..head_len].copy_from_slice(&scratch.0[head_mis..head_mis + head_len]);
+            done = head_len;
+        }
+
+        // Middle: 1 KiB chunks, 4-aligned length.
+        let mut chunk: EspAlignedBuffer<ESP_FLASH_READ_CHUNK_SIZE> = EspAlignedBuffer::new();
+        while done < buf.len() {
+            let remaining = buf.len() - done;
+            if remaining < ESP_FLASH_WORD_SIZE {
+                break; // <4B tail handled below
+            }
+            let n = core::cmp::min(ESP_FLASH_READ_CHUNK_SIZE, remaining & !(ESP_FLASH_WORD_SIZE - 1));
+            let r = unsafe {
+                esp32_rom::rom_read(
+                    offset + done as u32,
+                    chunk.0.as_ptr() as *const u32,
+                    n as u32,
+                )
+            };
+            rom_result(r)?;
+            buf[done..done + n].copy_from_slice(&chunk.0[..n]);
+            done += n;
+        }
+
+        // Tail (< 4 bytes): read one aligned word, copy the needed bytes.
+        if done < buf.len() {
+            let tail_off = offset + done as u32;
+            let word_off = tail_off & !(ESP_FLASH_WORD_SIZE as u32 - 1);
+            let skip = (tail_off - word_off) as usize;
+            let tail = buf.len() - done;
+            let mut scratch: EspAlignedBuffer<ESP_FLASH_WORD_SIZE> = EspAlignedBuffer::new();
+            let r = unsafe {
+                esp32_rom::rom_read(
+                    word_off,
+                    scratch.0.as_ptr() as *const u32,
+                    ESP_FLASH_WORD_SIZE as u32,
+                )
+            };
+            rom_result(r)?;
+            buf[done..].copy_from_slice(&scratch.0[skip..skip + tail]);
         }
         Ok(())
     }
@@ -151,34 +191,45 @@ impl Esp32c3InternalFlash {
         rom_result(r)
     }
 
-    /// Program `data` at `offset`. Does NOT auto-erase (NOR clears bits 1->0 only).
-    /// Stages through a 4-aligned page buffer; writes in 256-byte pages defensively.
-    pub fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), EspFlashError> {
+    /// Strict program: `offset` and `data.len()` must be 4-aligned; the
+    /// region must be pre-erased (NOR 1->0). No auto-erase, no tail padding. Writes
+    /// are split on 256-byte page boundaries so no ROM call crosses a page.
+    pub fn program_aligned(&mut self, offset: u32, data: &[u8]) -> Result<(), EspFlashError> {
+        if offset % ESP_FLASH_WORD_SIZE as u32 != 0 {
+            return Err(EspFlashError::UnalignedWrite);
+        }
+        if data.len() % ESP_FLASH_WORD_SIZE != 0 {
+            return Err(EspFlashError::UnalignedWrite);
+        }
         self.check_bounds(offset, data.len())?;
         if data.is_empty() {
             return Ok(());
         }
         let mut page: EspAlignedBuffer<ROM_PAGE_SIZE> = EspAlignedBuffer::new();
-        let mut off = 0usize;
-        while off < data.len() {
-            let n = core::cmp::min(ROM_PAGE_SIZE, data.len() - off);
-            page.0[..n].copy_from_slice(&data[off..off + n]);
-            // Pad the final partial page up to a word so ROM gets a 4-aligned len.
-            let padded = (n + ESP_FLASH_WORD_SIZE - 1) & !(ESP_FLASH_WORD_SIZE - 1);
-            for b in &mut page.0[n..padded] {
-                *b = 0xFF; // erased state; padding never clears bits that matter
-            }
+        let mut done = 0usize;
+        while done < data.len() {
+            let current_offset = offset + done as u32;
+            let offset_in_page = (current_offset as usize) % ROM_PAGE_SIZE;
+            let page_remaining = ROM_PAGE_SIZE - offset_in_page;
+            let write_len = core::cmp::min(page_remaining, data.len() - done);
+            // Staged through a 4-aligned buffer: ROM takes *const u32.
+            page.0[..write_len].copy_from_slice(&data[done..done + write_len]);
             let r = unsafe {
                 esp32_rom::rom_write(
-                    offset + off as u32,
+                    current_offset,
                     page.0.as_ptr() as *const u32,
-                    padded as u32,
+                    write_len as u32,
                 )
             };
             rom_result(r)?;
-            off += n;
+            done += write_len;
         }
         Ok(())
+    }
+
+    /// Thin passthrough to `program_aligned` (retained legacy name, no padding).
+    pub fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), EspFlashError> {
+        self.program_aligned(offset, data)
     }
 }
 
@@ -257,5 +308,40 @@ mod tests {
         let buf: EspAlignedBuffer<128> = EspAlignedBuffer::new();
         let addr = buf.0.as_ptr() as usize;
         assert_eq!(addr % ESP_FLASH_WORD_SIZE, 0);
+    }
+
+    #[test]
+    fn program_aligned_rejects_unaligned_offset() {
+        let mut f = Esp32c3InternalFlash::new(0x0040_0000);
+        let data = [0u8; 8]; // 4-aligned length
+        assert_eq!(f.program_aligned(1, &data), Err(EspFlashError::UnalignedWrite));
+        assert_eq!(f.program_aligned(2, &data), Err(EspFlashError::UnalignedWrite));
+        assert_eq!(f.program_aligned(3, &data), Err(EspFlashError::UnalignedWrite));
+    }
+
+    #[test]
+    fn program_aligned_rejects_unaligned_len() {
+        let mut f = Esp32c3InternalFlash::new(0x0040_0000);
+        assert_eq!(f.program_aligned(0, &[0u8; 3]), Err(EspFlashError::UnalignedWrite));
+        assert_eq!(f.program_aligned(0, &[0u8; 5]), Err(EspFlashError::UnalignedWrite));
+        assert_eq!(f.program_aligned(0, &[0u8; 7]), Err(EspFlashError::UnalignedWrite));
+    }
+
+    #[test]
+    fn program_aligned_rejects_out_of_bounds() {
+        let mut f = Esp32c3InternalFlash::new(0x0040_0000); // 4 MB
+        // Aligned but past capacity: offset+len must not exceed capacity.
+        assert_eq!(
+            f.program_aligned(0x0040_0000, &[0u8; 8]),
+            Err(EspFlashError::OutOfBounds)
+        );
+    }
+
+    #[test]
+    fn program_aligned_accepts_aligned_empty() {
+        let mut f = Esp32c3InternalFlash::new(0x0040_0000);
+        // Empty data short-circuits before any ROM call.
+        assert_eq!(f.program_aligned(0, &[]), Ok(()));
+        assert_eq!(f.program_aligned(4, &[]), Ok(()));
     }
 }
