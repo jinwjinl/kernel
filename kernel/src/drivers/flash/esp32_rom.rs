@@ -35,13 +35,26 @@ unsafe extern "C" {
     fn Cache_Resume_ICache(state: u32);
     fn Cache_Invalidate_Addr(vaddr: u32, len: u32);
     fn Cache_Invalidate_ICache_All();
+    // Returns 0 on success; 2/3/4 = vaddr-paddr unaligned / psize error / vaddr out of range.
+    fn Cache_Ibus_MMU_Set(
+        ext_ram: u32,
+        vaddr: u32,
+        paddr: u32,
+        psize: u32,
+        num: u32,
+        fixed: u32,
+    ) -> i32;
 }
+
+// Flash MMU table base (EXTMEM region) and the invalid-entry sentinel (BIT(8)).
+const DR_REG_MMU_TABLE: u32 = 0x600C_5000;
+const SOC_MMU_INVALID: u32 = 0x100;
 
 const DROM_VADDR_BASE: u32 = 0x3C00_0000;
 
 /// Run `body` with IRQs disabled and ICache suspended across the ROM call.
 #[inline(always)]
-fn with_flash_op<R>(body: impl FnOnce() -> R) -> R {
+pub(crate) fn with_flash_op<R>(body: impl FnOnce() -> R) -> R {
     let flags = disable_local_irq_save();
     let cache_state = unsafe { Cache_Suspend_ICache() };
     let result = body();
@@ -80,6 +93,27 @@ pub(crate) unsafe fn rom_erase_block(block_index: u32) -> i32 {
     with_flash_op(|| unsafe { esp_rom_spiflash_erase_block(block_index) })
 }
 
+// IRAM-resident: suspends the unified I+D cache, so the wrapper body must be
+// fetchable from IRAM (flash-backed fetches stall while suspended), same as
+// rom_read/rom_write. The underlying op is a register write, not flash
+// erase/program, so with_flash_op's cache guard is the only protection needed.
+#[link_section = ".rwtext"]
+#[inline(never)]
+pub(crate) unsafe fn rom_mmu_map(vaddr: u32, paddr: u32, num_pages: u32) -> i32 {
+    // fixed=0 -> linear 1:1 across `num_pages` consecutive 64KB pages.
+    with_flash_op(|| unsafe { Cache_Ibus_MMU_Set(0, vaddr, paddr, 64, num_pages, 0) })
+}
+
+// Same .rwtext/cache-guard rationale as rom_mmu_map. Writes the INVALID sentinel
+// (BIT(8)) to one MMU table entry, mirroring mmu_ll_set_entry_invalid.
+#[link_section = ".rwtext"]
+#[inline(never)]
+pub(crate) unsafe fn rom_mmu_unmap(entry_id: u32) {
+    with_flash_op(|| unsafe {
+        *(DR_REG_MMU_TABLE as *mut u32).add(entry_id as usize) = SOC_MMU_INVALID;
+    })
+}
+
 // Called once at init with interrupts live; not cache-protected (one-shot reg clear).
 pub(crate) unsafe fn rom_unlock() -> i32 {
     unsafe { esp_rom_spiflash_unlock() }
@@ -89,4 +123,9 @@ pub(crate) unsafe fn rom_unlock() -> i32 {
 // no erase/program, so no cache guard needed.
 pub(crate) unsafe fn rom_chip_size() -> u32 {
     unsafe { spi_flash_get_chip_size() }
+}
+
+// Invalidate the entire I-cache. Register op only, no erase/program.
+pub(crate) unsafe fn rom_invalidate_icache_all() {
+    unsafe { Cache_Invalidate_ICache_All() };
 }

@@ -158,7 +158,7 @@ extern "C" fn init() {
         if let Err(e) = crate::drivers::flash::init_internal_flash() {
             log::warn!("Failed to init internal flash: {:?}", e);
         }
-        if let Err(e) = crate::devices::esp32_flash::init_esp32_flash_device() {
+        if let Err(e) = crate::drivers::flash::init_esp32_flash_device() {
             log::warn!("Failed to init esp32-flash0: {:?}", e);
         }
     }

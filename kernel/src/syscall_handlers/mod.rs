@@ -480,6 +480,17 @@ alloc_mem(ptr: *mut *mut c_void, size: usize, align: usize) -> c_long {
     }
     let addr = crate::allocator::malloc_align(size, align);
     if addr.is_null() {
+        let info = crate::allocator::memory_info();
+        let max_free = crate::allocator::get_max_free_block_size();
+        crate::kearly_println!(
+            "[OOM] request={} align={} total={} used={} max_used={} max_free={}",
+            size,
+            align,
+            info.total,
+            info.used,
+            info.max_used,
+            max_free,
+        );
         return -1;
     }
     unsafe { ptr.write(addr as *mut c_void) };
