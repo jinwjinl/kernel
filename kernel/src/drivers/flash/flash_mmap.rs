@@ -20,6 +20,14 @@
 //! `Cache_Ibus_MMU_Set`, then invalidates ICache and issues `fence.i`.
 //! `unmap_exec` invalidates the entries. Both wrap the table write in the
 //! IRAM-resident cache-suspend guard.
+//!
+//! The C3 is ICache-only with a single shared MMU table: an IROM vaddr and a
+//! DROM vaddr at the same offset resolve to the same entry
+//! (`(vaddr & 0x7FFFFF) >> 16`, per esp-idf hal/esp32c3 mmu_ll.h). `map_exec`
+//! therefore calls `Cache_Dbus_MMU_Set` in addition to `Cache_Ibus_MMU_Set` so
+//! the mapped image is reachable both as code (I-bus) and as data (D-bus); both
+//! calls land on the same table entry. `unmap_exec` writes the entry once,
+//! which clears both views.
 
 use super::esp32_rom;
 use super::esp32_flash::{LOADABLE_REGION_BASE, LOADABLE_REGION_END};
@@ -30,6 +38,8 @@ pub const FLASH_MMU_PAGE_SIZE: u32 = 0x0001_0000;
 
 // IROM window base (link.x: IROM ORIGIN = 0x42000000 + 0x20).
 const IROM_VADDR_BASE: u32 = 0x4200_0000;
+// DROM window base (link.x: DROM ORIGIN = 0x3C000000).
+const DROM_VADDR_BASE: u32 = 0x3C00_0000;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MapError {
@@ -134,6 +144,22 @@ pub fn map_exec(physical_offset: u32, size: usize) -> Result<ExecMapping, MapErr
             state.live_handle = None;
             return Err(MapError::OutOfRange);
         }
+        // Also register the D-bus (DROM) view of the same pages so the image is
+        // readable as data. C3's shared table lands this on the same entries as
+        // the I-bus call above; the D-bus call just wires up the D-bus window.
+        let drom_vaddr = DROM_VADDR_BASE.wrapping_add(page_base);
+        let rc_d = unsafe { esp32_rom::rom_mmu_map_d(drom_vaddr, page_base, num_pages) };
+        if rc_d != 0 {
+            // Roll back the I-bus entries just programmed, then release the handle.
+            let mut v = mapped_page_address;
+            for _ in 0..num_pages {
+                let entry_id = (v & 0x7F_FFFF) >> 16;
+                unsafe { esp32_rom::rom_mmu_unmap(entry_id) };
+                v += FLASH_MMU_PAGE_SIZE;
+            }
+            state.live_handle = None;
+            return Err(MapError::OutOfRange);
+        }
     }
 
     unsafe {
@@ -161,6 +187,9 @@ pub fn unmap_exec(mapping: &ExecMapping) -> Result<(), MapError> {
             {
                 let num_pages = (mapping.mapped_size / FLASH_MMU_PAGE_SIZE as usize) as u32;
                 let mut vaddr = mapping.mapped_page_address as u32;
+                // One write per entry clears both I-bus and D-bus views: C3's
+                // shared table resolves the IROM and DROM vaddrs to the same
+                // entry, so the D-bus mapping installed in map_exec is gone too.
                 for _ in 0..num_pages {
                     let entry_id = (vaddr & 0x7F_FFFF) >> 16;
                     unsafe { esp32_rom::rom_mmu_unmap(entry_id) };

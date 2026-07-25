@@ -44,6 +44,19 @@ unsafe extern "C" {
         num: u32,
         fixed: u32,
     ) -> i32;
+    // D-bus (DROM) counterpart; same signature/semantics as Cache_Ibus_MMU_Set.
+    // C3 shares one MMU table across I-bus and D-bus (ICache-only, no DCache):
+    // (vaddr & 0x7FFFFF) >> 16 yields the same entry_id for an IROM and a DROM
+    // vaddr at the same offset (esp-idf hal/esp32c3 mmu_ll.h). The D-bus call
+    // configures the D-bus window registers so that entry is reachable as data.
+    fn Cache_Dbus_MMU_Set(
+        ext_ram: u32,
+        vaddr: u32,
+        paddr: u32,
+        psize: u32,
+        num: u32,
+        fixed: u32,
+    ) -> i32;
 }
 
 // Flash MMU table base (EXTMEM region) and the invalid-entry sentinel (BIT(8)).
@@ -104,6 +117,16 @@ pub(crate) unsafe fn rom_mmu_map(vaddr: u32, paddr: u32, num_pages: u32) -> i32 
     with_flash_op(|| unsafe { Cache_Ibus_MMU_Set(0, vaddr, paddr, 64, num_pages, 0) })
 }
 
+// D-bus (DROM) mapping, mirroring rom_mmu_map. Same .rwtext/cache-guard
+// rationale: register op under the unified cache-suspend guard. `vaddr` is the
+// DROM-window address (DROM_VADDR_BASE + page_base); `paddr` is unchanged
+// (same physical flash page the I-bus mapping points at).
+#[link_section = ".rwtext"]
+#[inline(never)]
+pub(crate) unsafe fn rom_mmu_map_d(vaddr: u32, paddr: u32, num_pages: u32) -> i32 {
+    with_flash_op(|| unsafe { Cache_Dbus_MMU_Set(0, vaddr, paddr, 64, num_pages, 0) })
+}
+
 // Same .rwtext/cache-guard rationale as rom_mmu_map. Writes the INVALID sentinel
 // (BIT(8)) to one MMU table entry, mirroring mmu_ll_set_entry_invalid.
 #[link_section = ".rwtext"]
@@ -112,6 +135,15 @@ pub(crate) unsafe fn rom_mmu_unmap(entry_id: u32) {
     with_flash_op(|| unsafe {
         *(DR_REG_MMU_TABLE as *mut u32).add(entry_id as usize) = SOC_MMU_INVALID;
     })
+}
+
+// Diagnostic: read one MMU table entry register. Pure MMIO read (no flash
+// erase/program), so the cache-suspend guard is not required; runs in .rwtext
+// only to keep all MMU-table access colocated.
+#[link_section = ".rwtext"]
+#[inline(never)]
+pub(crate) unsafe fn rom_mmu_entry_read(entry_id: u32) -> u32 {
+    unsafe { core::ptr::read_volatile((DR_REG_MMU_TABLE as *const u32).add(entry_id as usize)) }
 }
 
 // Called once at init with interrupts live; not cache-protected (one-shot reg clear).

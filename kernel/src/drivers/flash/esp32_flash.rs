@@ -17,7 +17,7 @@
 use crate::{
     devices::{Device, DeviceClass, DeviceId, DeviceManager},
     drivers::flash::{
-        flash_mmap::{self, ExecMapping, MapError},
+        esp32_rom, flash_mmap::{self, ExecMapping, MapError},
         internal_flash::{
             with_internal_flash, EspFlashError, ESP_FLASH_SECTOR_SIZE, ESP_FLASH_WORD_SIZE,
         },
@@ -36,6 +36,13 @@ pub const ESP32_FLASH_ABORT: u32 = 0x42;
 pub const ESP32_FLASH_CLEAR: u32 = 0x43;
 pub const ESP32_FLASH_MAP: u32 = 0x44;
 pub const ESP32_FLASH_UNMAP: u32 = 0x45;
+// Local/experimental: not merged to mainline. Returns the kernel DRAM safe base
+// (__sys_stack_end) so the userspace loader knows where free SRAM begins for
+// copying out-of-window RW segments at load time.
+pub const ESP32_FLASH_QUERY_DRAM_SAFE: u32 = 0x46;
+// Local/diagnostic: reads 4 bytes back through the arg out-pointer to localize
+// the 0x4220185E illegal-instruction trap. Read-only, no device state change.
+pub const ESP32_FLASH_PROBE_LMA: u32 = 0x47;
 
 // Loadable Region: factory partition end .. 4 MB flash end.
 // Single source of truth; partition table `factory` end MUST equal LOADABLE_REGION_BASE.
@@ -397,6 +404,71 @@ impl Esp32FlashDevice {
             }
         }
     }
+
+    /// QUERY_DRAM_SAFE: write the kernel DRAM safe base (__sys_stack_end) to the
+    /// caller's *mut u32 so the loader knows where free SRAM for RW segments
+    /// begins. Local/experimental ioctl, not merged to mainline. Read-only symbol
+    /// query, independent of device state, so no state lock needed.
+    fn ioctl_query_dram_safe(&self, arg: usize) -> Result<(), ErrorKind> {
+        if arg != 0 {
+            // SAFETY: caller passes a valid writable u32 (tmpfs ioctl bridge passes
+            // arg through unchecked, matching existing ioctl_map conventions).
+            // addr_of! avoids borrowing a `static mut` (static_mut_refs lint);
+            // boot.rs uses the same idiom for these linker symbols.
+            let safe = core::ptr::addr_of!(crate::boot::__sys_stack_end) as u32;
+            unsafe { *(arg as *mut u32) = safe };
+        }
+        Ok(())
+    }
+
+    /// PROBE_LMA: diagnostic. Reads 4 values at the known trap point and writes
+    /// them back through the arg out-pointer so the loader can print them. Read-
+    /// only, independent of device state, so no state lock. Local/diagnostic,
+    /// not merged to mainline.
+    fn ioctl_probe_lma(&self, arg: usize) -> Result<(), ErrorKind> {
+        // Fixed trap point: vaddr 0x4220185E, MMU entry 32, physical 0x20185E,
+        // D-bus view 0x3C20185E. All derived from the observed illegal-instr trap.
+        const TRAP_VADDR: u32 = 0x4220_185E;
+        const TRAP_ENTRY: u32 = 32;
+        const TRAP_PHYS: u32 = 0x0020_185E;
+        const TRAP_DBUS: u32 = 0x3C20_185E;
+
+        let entry32 = unsafe { esp32_rom::rom_mmu_entry_read(TRAP_ENTRY) };
+
+        // Cache-bypass physical read of one byte. rom_read wants a word-aligned
+        // buffer; read 4 bytes and take the first.
+        let mut phys_word: u32 = 0xFFFF_FFFF;
+        let _ = unsafe {
+            esp32_rom::rom_read(
+                TRAP_PHYS & !0x3,
+                &mut phys_word as *mut u32 as *const u32,
+                4,
+            )
+        };
+        let phys_byte = (phys_word >> ((TRAP_PHYS & 0x3) * 8)) as u8 as u32;
+
+        // D-bus and I-bus vaddr reads go through the Flash MMU + ICache (the same
+        // path fetch uses), so a 0xFF here is the real trap signal.
+        // SAFETY: map_exec has run and invalidated ICache; the vaddr is mapped.
+        // A load does not trap on illegal instruction data; an unmapped entry
+        // would raise access-fault (also useful diagnostic), so this never hangs.
+        let dbus_byte = unsafe { core::ptr::read_volatile(TRAP_DBUS as *const u8) as u32 };
+        let ibus_byte = unsafe { core::ptr::read_volatile(TRAP_VADDR as *const u8) as u32 };
+
+        if arg != 0 {
+            // SAFETY: caller passes a valid writable 16-byte ProbeResult; the VFS
+            // ioctl bridge passes arg through unchecked (same as ioctl_map).
+            let out: [u32; 4] = [entry32, phys_byte, dbus_byte, ibus_byte];
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    out.as_ptr(),
+                    arg as *mut u32,
+                    out.len(),
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Device for Esp32FlashDevice {
@@ -446,6 +518,8 @@ impl Device for Esp32FlashDevice {
             ESP32_FLASH_CLEAR => self.ioctl_clear(),
             ESP32_FLASH_MAP => self.ioctl_map(arg),
             ESP32_FLASH_UNMAP => self.ioctl_unmap(),
+            ESP32_FLASH_QUERY_DRAM_SAFE => self.ioctl_query_dram_safe(arg),
+            ESP32_FLASH_PROBE_LMA => self.ioctl_probe_lma(arg),
             _ => Err(ErrorKind::Unsupported),
         }
     }
