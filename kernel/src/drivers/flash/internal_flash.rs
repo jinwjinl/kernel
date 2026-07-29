@@ -16,21 +16,26 @@
 //! `write()` does NOT auto-erase; callers must `erase_region` first.
 
 use super::esp32_rom;
-use crate::sync::SpinLock;
+use crate::{scheduler, sync::Mutex, time::Tick};
+use core::sync::atomic::{AtomicU32, Ordering};
 
 pub const ESP_FLASH_SECTOR_SIZE: usize = 4096;
 pub const ESP_FLASH_WORD_SIZE: usize = 4;
-const ROM_PAGE_SIZE: usize = 256; // NOR page-program granularity
-const ESP_FLASH_READ_CHUNK_SIZE: usize = 1024; // batch read granularity
+const ROM_PAGE_SIZE: usize = 256;
+const ESP_FLASH_READ_CHUNK_SIZE: usize = 1024;
 
 /// One-shot boot unlock. Per-write re-unlock is unnecessary for the raw API.
 pub(crate) fn init_internal_flash() -> Result<(), EspFlashError> {
+    if !INTERNAL_FLASH_LOCK.init() {
+        return Err(EspFlashError::Busy);
+    }
     let r = unsafe { esp32_rom::rom_unlock() };
     if r != esp32_rom::ESP_ROM_SPIFLASH_RESULT_OK {
         log::warn!("esp_rom_spiflash_unlock returned {}", r);
         return Err(EspFlashError::RomError(r));
     }
     let chip_size = unsafe { esp32_rom::rom_chip_size() };
+    INTERNAL_FLASH_CAPACITY.store(chip_size, Ordering::Release);
     log::info!(
         "internal flash ROM chip size: {} bytes ({:#x})",
         chip_size,
@@ -39,15 +44,49 @@ pub(crate) fn init_internal_flash() -> Result<(), EspFlashError> {
     Ok(())
 }
 
-/// Cross-thread serialization for flash ops; ROM wrappers only guard one call.
-static INTERNAL_FLASH_LOCK: SpinLock<()> = SpinLock::new(());
+/// Serializes complete multi-call transactions after scheduling starts; boot is single-threaded.
+static INTERNAL_FLASH_LOCK: Mutex = Mutex::new();
+static INTERNAL_FLASH_CAPACITY: AtomicU32 = AtomicU32::new(0);
+
+struct InternalFlashGuard {
+    locked: bool,
+}
+
+impl InternalFlashGuard {
+    fn acquire() -> Result<Self, EspFlashError> {
+        let locked = scheduler::is_schedule_ready();
+        if locked && !INTERNAL_FLASH_LOCK.pend_for(Tick::MAX) {
+            return Err(EspFlashError::Busy);
+        }
+        Ok(Self { locked })
+    }
+}
+
+impl Drop for InternalFlashGuard {
+    fn drop(&mut self) {
+        if self.locked {
+            INTERNAL_FLASH_LOCK.post();
+        }
+    }
+}
+
+pub fn with_internal_flash_exclusive<R>(operation: impl FnOnce() -> R) -> Result<R, EspFlashError> {
+    let _guard = InternalFlashGuard::acquire()?;
+    Ok(operation())
+}
 
 pub fn with_internal_flash<R>(
     operation: impl FnOnce(&mut Esp32c3InternalFlash) -> Result<R, EspFlashError>,
 ) -> Result<R, EspFlashError> {
-    let _guard = INTERNAL_FLASH_LOCK.lock();
-    let mut flash = Esp32c3InternalFlash::detect()?;
-    operation(&mut flash)
+    with_internal_flash_exclusive(|| {
+        let capacity = INTERNAL_FLASH_CAPACITY.load(Ordering::Acquire);
+        let mut flash = if capacity == 0 {
+            Esp32c3InternalFlash::detect()?
+        } else {
+            Esp32c3InternalFlash::new(capacity)
+        };
+        operation(&mut flash)
+    })?
 }
 
 /// Raw API error type.
@@ -80,7 +119,6 @@ impl Esp32c3InternalFlash {
         Self { capacity }
     }
 
-    /// Construct on demand from the ROM chip size; unlock stays in `init_internal_flash`.
     pub fn detect() -> Result<Self, EspFlashError> {
         let size = unsafe { esp32_rom::rom_chip_size() };
         Ok(Self::new(size))
@@ -90,26 +128,24 @@ impl Esp32c3InternalFlash {
         self.capacity
     }
 
-    /// `offset + len` must fit within `capacity` (no wraparound).
+    /// `offset + len` must fit within `capacity`.
     fn check_bounds(&self, offset: u32, len: usize) -> Result<(), EspFlashError> {
-        let end = offset
-            .checked_add(len as u32)
-            .ok_or(EspFlashError::OutOfBounds)?;
+        let len = u32::try_from(len).map_err(|_| EspFlashError::OutOfBounds)?;
+        let end = offset.checked_add(len).ok_or(EspFlashError::OutOfBounds)?;
         if end > self.capacity {
             return Err(EspFlashError::OutOfBounds);
         }
         Ok(())
     }
 
-    /// Read `buf.len()` bytes from `offset`, batched in 1 KiB chunks. ROM takes
-    /// a 4-aligned `*const u32`, so unaligned head/tail are staged through a word buffer.
+    /// Read `buf.len()` bytes from `offset`. ROM takes a 4-aligned `*const u32`,
+    /// so unaligned head/tail are staged through a word buffer.
     pub fn read(&mut self, offset: u32, buf: &mut [u8]) -> Result<(), EspFlashError> {
         self.check_bounds(offset, buf.len())?;
         if buf.is_empty() {
             return Ok(());
         }
 
-        // Head: align `offset` down to a word, copy the needed leading bytes.
         let mut done = 0usize;
         let head_mis = (offset as usize) & (ESP_FLASH_WORD_SIZE - 1);
         if head_mis != 0 {
@@ -135,7 +171,10 @@ impl Esp32c3InternalFlash {
             if remaining < ESP_FLASH_WORD_SIZE {
                 break; // <4B tail handled below
             }
-            let n = core::cmp::min(ESP_FLASH_READ_CHUNK_SIZE, remaining & !(ESP_FLASH_WORD_SIZE - 1));
+            let n = core::cmp::min(
+                ESP_FLASH_READ_CHUNK_SIZE,
+                remaining & !(ESP_FLASH_WORD_SIZE - 1),
+            );
             let r = unsafe {
                 esp32_rom::rom_read(
                     offset + done as u32,
@@ -186,14 +225,11 @@ impl Esp32c3InternalFlash {
     }
 
     fn erase_sector(&mut self, sector: u32) -> Result<(), EspFlashError> {
-        // ROM erase_sector takes a sector INDEX (byte_off / 4096), not a byte offset.
+        // ROM takes a sector INDEX (byte_off / 4096), not a byte offset.
         let r = unsafe { esp32_rom::rom_erase_sector(sector) };
         rom_result(r)
     }
 
-    /// Strict program: `offset` and `data.len()` must be 4-aligned; the
-    /// region must be pre-erased (NOR 1->0). No auto-erase, no tail padding. Writes
-    /// are split on 256-byte page boundaries so no ROM call crosses a page.
     pub fn program_aligned(&mut self, offset: u32, data: &[u8]) -> Result<(), EspFlashError> {
         if offset % ESP_FLASH_WORD_SIZE as u32 != 0 {
             return Err(EspFlashError::UnalignedWrite);
@@ -212,7 +248,6 @@ impl Esp32c3InternalFlash {
             let offset_in_page = (current_offset as usize) % ROM_PAGE_SIZE;
             let page_remaining = ROM_PAGE_SIZE - offset_in_page;
             let write_len = core::cmp::min(page_remaining, data.len() - done);
-            // Staged through a 4-aligned buffer: ROM takes *const u32.
             page.0[..write_len].copy_from_slice(&data[done..done + write_len]);
             let r = unsafe {
                 esp32_rom::rom_write(
@@ -227,9 +262,48 @@ impl Esp32c3InternalFlash {
         Ok(())
     }
 
-    /// Thin passthrough to `program_aligned` (retained legacy name, no padding).
+    /// Program arbitrary bytes without erasing. ROM calls stay 4-byte aligned,
+    /// never cross a 256-byte page, and pad unaligned head/tail with 0xFF so
+    /// out-of-range bytes are unchanged (NOR only clears bits).
     pub fn write(&mut self, offset: u32, data: &[u8]) -> Result<(), EspFlashError> {
-        self.program_aligned(offset, data)
+        self.check_bounds(offset, data.len())?;
+        if data.is_empty() {
+            return Ok(());
+        }
+
+        let data_len = u32::try_from(data.len()).map_err(|_| EspFlashError::OutOfBounds)?;
+        let data_end = offset
+            .checked_add(data_len)
+            .ok_or(EspFlashError::OutOfBounds)?;
+        let mut current = offset & !(ESP_FLASH_WORD_SIZE as u32 - 1);
+        let aligned_end = data_end
+            .checked_add(ESP_FLASH_WORD_SIZE as u32 - 1)
+            .map(|end| end & !(ESP_FLASH_WORD_SIZE as u32 - 1))
+            .ok_or(EspFlashError::OutOfBounds)?;
+        let mut page: EspAlignedBuffer<ROM_PAGE_SIZE> = EspAlignedBuffer::new_ff();
+
+        while current < aligned_end {
+            let page_remaining = ROM_PAGE_SIZE - current as usize % ROM_PAGE_SIZE;
+            let remaining = (aligned_end - current) as usize;
+            let write_len = core::cmp::min(page_remaining, remaining);
+            page.0[..write_len].fill(0xFF);
+
+            let copy_start = core::cmp::max(current, offset);
+            let copy_end = core::cmp::min(current + write_len as u32, data_end);
+            if copy_start < copy_end {
+                let src = (copy_start - offset) as usize;
+                let dst = (copy_start - current) as usize;
+                let len = (copy_end - copy_start) as usize;
+                page.0[dst..dst + len].copy_from_slice(&data[src..src + len]);
+            }
+
+            let r = unsafe {
+                esp32_rom::rom_write(current, page.0.as_ptr() as *const u32, write_len as u32)
+            };
+            rom_result(r)?;
+            current += write_len as u32;
+        }
+        Ok(())
     }
 }
 
@@ -240,6 +314,10 @@ struct EspAlignedBuffer<const N: usize>([u8; N]);
 impl<const N: usize> EspAlignedBuffer<N> {
     const fn new() -> Self {
         Self([0u8; N])
+    }
+
+    const fn new_ff() -> Self {
+        Self([0xFFu8; N])
     }
 }
 
@@ -259,7 +337,7 @@ mod tests {
         let f = Esp32c3InternalFlash::new(4096);
         assert!(f.check_bounds(0, 4096).is_ok());
         assert!(f.check_bounds(0, 0).is_ok());
-        assert!(f.check_bounds(4096, 0).is_ok()); // zero-len at the edge
+        assert!(f.check_bounds(4096, 0).is_ok());
     }
 
     #[test]
@@ -267,7 +345,6 @@ mod tests {
         let f = Esp32c3InternalFlash::new(4096);
         assert_eq!(f.check_bounds(0, 4097), Err(EspFlashError::OutOfBounds));
         assert_eq!(f.check_bounds(1, 4096), Err(EspFlashError::OutOfBounds));
-        // offset+len must not wrap around to Ok
         assert_eq!(f.check_bounds(u32::MAX, 1), Err(EspFlashError::OutOfBounds));
     }
 
@@ -276,14 +353,12 @@ mod tests {
         let mut f = Esp32c3InternalFlash::new(0x0040_0000);
         assert_eq!(f.erase_region(1, 4096), Err(EspFlashError::UnalignedErase));
         assert_eq!(f.erase_region(0, 1), Err(EspFlashError::UnalignedErase));
-        // alignment is checked first, so an unaligned offset is rejected even for len 0
         assert_eq!(f.erase_region(1, 0), Err(EspFlashError::UnalignedErase));
     }
 
     #[test]
     fn erase_region_rejects_out_of_bounds() {
         let mut f = Esp32c3InternalFlash::new(0x0040_0000);
-        // aligned but past capacity
         assert_eq!(
             f.erase_region(0x0040_0000, 4096),
             Err(EspFlashError::OutOfBounds)
@@ -313,24 +388,41 @@ mod tests {
     #[test]
     fn program_aligned_rejects_unaligned_offset() {
         let mut f = Esp32c3InternalFlash::new(0x0040_0000);
-        let data = [0u8; 8]; // 4-aligned length
-        assert_eq!(f.program_aligned(1, &data), Err(EspFlashError::UnalignedWrite));
-        assert_eq!(f.program_aligned(2, &data), Err(EspFlashError::UnalignedWrite));
-        assert_eq!(f.program_aligned(3, &data), Err(EspFlashError::UnalignedWrite));
+        let data = [0u8; 8];
+        assert_eq!(
+            f.program_aligned(1, &data),
+            Err(EspFlashError::UnalignedWrite)
+        );
+        assert_eq!(
+            f.program_aligned(2, &data),
+            Err(EspFlashError::UnalignedWrite)
+        );
+        assert_eq!(
+            f.program_aligned(3, &data),
+            Err(EspFlashError::UnalignedWrite)
+        );
     }
 
     #[test]
     fn program_aligned_rejects_unaligned_len() {
         let mut f = Esp32c3InternalFlash::new(0x0040_0000);
-        assert_eq!(f.program_aligned(0, &[0u8; 3]), Err(EspFlashError::UnalignedWrite));
-        assert_eq!(f.program_aligned(0, &[0u8; 5]), Err(EspFlashError::UnalignedWrite));
-        assert_eq!(f.program_aligned(0, &[0u8; 7]), Err(EspFlashError::UnalignedWrite));
+        assert_eq!(
+            f.program_aligned(0, &[0u8; 3]),
+            Err(EspFlashError::UnalignedWrite)
+        );
+        assert_eq!(
+            f.program_aligned(0, &[0u8; 5]),
+            Err(EspFlashError::UnalignedWrite)
+        );
+        assert_eq!(
+            f.program_aligned(0, &[0u8; 7]),
+            Err(EspFlashError::UnalignedWrite)
+        );
     }
 
     #[test]
     fn program_aligned_rejects_out_of_bounds() {
-        let mut f = Esp32c3InternalFlash::new(0x0040_0000); // 4 MB
-        // Aligned but past capacity: offset+len must not exceed capacity.
+        let mut f = Esp32c3InternalFlash::new(0x0040_0000);
         assert_eq!(
             f.program_aligned(0x0040_0000, &[0u8; 8]),
             Err(EspFlashError::OutOfBounds)
@@ -340,7 +432,6 @@ mod tests {
     #[test]
     fn program_aligned_accepts_aligned_empty() {
         let mut f = Esp32c3InternalFlash::new(0x0040_0000);
-        // Empty data short-circuits before any ROM call.
         assert_eq!(f.program_aligned(0, &[]), Ok(()));
         assert_eq!(f.program_aligned(4, &[]), Ok(()));
     }

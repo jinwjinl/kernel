@@ -14,32 +14,27 @@
 
 //! ESP32-C3 Flash MMU executable mapping (XIP) for the Loadable Region.
 //!
-//! The 2nd-stage bootloader maps ONLY the kernel's own IROM/DROM segments
-//! (entries 0-9); the Loadable Region (paddr 0x110000+) is NOT pre-mapped.
-//! `map_exec` writes the MMU table entry for each 64KB page via the ROM
-//! `Cache_Ibus_MMU_Set`, then invalidates ICache and issues `fence.i`.
-//! `unmap_exec` invalidates the entries. Both wrap the table write in the
-//! IRAM-resident cache-suspend guard.
+//! The 2nd-stage bootloader maps only the kernel's own IROM/DROM segments; the
+//! Loadable Region (paddr 0x110000+) is NOT pre-mapped. `map_exec` programs the
+//! MMU table entry for each 64 KB page, then invalidates ICache + `fence.i`;
+//! `unmap_exec` invalidates the entries.
 //!
-//! The C3 is ICache-only with a single shared MMU table: an IROM vaddr and a
-//! DROM vaddr at the same offset resolve to the same entry
-//! (`(vaddr & 0x7FFFFF) >> 16`, per esp-idf hal/esp32c3 mmu_ll.h). `map_exec`
-//! therefore calls `Cache_Dbus_MMU_Set` in addition to `Cache_Ibus_MMU_Set` so
-//! the mapped image is reachable both as code (I-bus) and as data (D-bus); both
-//! calls land on the same table entry. `unmap_exec` writes the entry once,
-//! which clears both views.
+//! The C3 is ICache-only with a single shared MMU table: IROM and DROM vaddrs
+//! at the same offset resolve to one entry (`(vaddr & 0x7FFFFF) >> 16`).
+//! `map_exec` therefore calls both `Cache_Ibus_MMU_Set` and `Cache_Dbus_MMU_Set`
+//! so the image is reachable as code (I-bus) and data (D-bus); both land on the
+//! same entry, so `unmap_exec` writes it once to clear both views.
 
 use super::esp32_rom;
-use super::esp32_flash::{LOADABLE_REGION_BASE, LOADABLE_REGION_END};
-use crate::sync::SpinLock;
-
+use crate::{
+    boards::{
+        DROM_VADDR_BASE, IROM_VADDR_BASE, LOADABLE_REGION_BASE, LOADABLE_REGION_END,
+        LOADABLE_REGION_SIZE,
+    },
+    sync::SpinLock,
+};
 // 64 KB. Hardware constrains vaddr%PAGE == paddr%PAGE.
-pub const FLASH_MMU_PAGE_SIZE: u32 = 0x0001_0000;
-
-// IROM window base (link.x: IROM ORIGIN = 0x42000000 + 0x20).
-const IROM_VADDR_BASE: u32 = 0x4200_0000;
-// DROM window base (link.x: DROM ORIGIN = 0x3C000000).
-const DROM_VADDR_BASE: u32 = 0x3C00_0000;
+pub use crate::boards::FLASH_MMU_PAGE_SIZE;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum MapError {
@@ -62,10 +57,10 @@ pub struct ExecMapping {
     handle: u64,
 }
 
-// At most one live ExecMapping (path-1 demo).
 struct MmapState {
     live_handle: Option<u64>,
     next_handle: u64,
+    busy: bool,
 }
 
 impl MmapState {
@@ -73,6 +68,7 @@ impl MmapState {
         Self {
             live_handle: None,
             next_handle: 1,
+            busy: false,
         }
     }
 }
@@ -102,8 +98,14 @@ fn check_loadable_range(physical_offset: u32, physical_end: u32) -> Result<(), M
     Ok(())
 }
 
+fn physical_to_irom_vaddr(physical_offset: u32) -> Result<u32, MapError> {
+    IROM_VADDR_BASE
+        .checked_add(physical_offset)
+        .ok_or(MapError::Overflow)
+}
+
 /// Map `[physical_offset, physical_offset+size)` as executable. `segment_address`
-/// is the virtual address the caller jumps to. Path-1: no MMU table write.
+/// is the virtual address the caller jumps to.
 pub fn map_exec(physical_offset: u32, size: usize) -> Result<ExecMapping, MapError> {
     if size == 0 {
         return Err(MapError::ZeroSize);
@@ -117,47 +119,54 @@ pub fn map_exec(physical_offset: u32, size: usize) -> Result<ExecMapping, MapErr
     let page_base = physical_offset & !(FLASH_MMU_PAGE_SIZE - 1);
     let page_offset = (physical_offset - page_base) as usize;
     let required_size = page_offset.checked_add(size).ok_or(MapError::Overflow)?;
-    let mapped_size = align_up(required_size, FLASH_MMU_PAGE_SIZE as usize)
-        .ok_or(MapError::Overflow)?;
-    let mapped_page_address = IROM_VADDR_BASE
-        .checked_add(page_base)
-        .ok_or(MapError::Overflow)?;
+    let mapped_size =
+        align_up(required_size, FLASH_MMU_PAGE_SIZE as usize).ok_or(MapError::Overflow)?;
+    let mapped_page_address = physical_to_irom_vaddr(page_base)?;
     let segment_address = mapped_page_address
         .checked_add(page_offset as u32)
         .ok_or(MapError::Overflow)?;
 
-    let mut state = MMAP_STATE.lock();
-    if state.live_handle.is_some() {
-        return Err(MapError::AlreadyMapped);
-    }
-    let handle = state.next_handle;
-    state.next_handle = state.next_handle.wrapping_add(1);
-    state.live_handle = Some(handle);
+    let handle = {
+        let mut state = MMAP_STATE.irqsave_lock();
+        if state.live_handle.is_some() || state.busy {
+            return Err(MapError::AlreadyMapped);
+        }
+        let handle = state.next_handle;
+        state.next_handle = state.next_handle.wrapping_add(1);
+        state.live_handle = Some(handle);
+        state.busy = true;
+        handle
+    };
 
     #[cfg(not(test))]
     {
-        // vaddr/paddr page-aligned by construction; one ROM call covers all
-        // pages (num=N, fixed=0 -> linear 1:1). rc: 0=ok, 2/3/4=align/psize/range.
+        // vaddr/paddr page-aligned by construction; one ROM call covers all pages
+        // (linear 1:1). rc: 0=ok, 2/3/4=align/psize/range.
         let num_pages = (mapped_size / FLASH_MMU_PAGE_SIZE as usize) as u32;
         let rc = unsafe { esp32_rom::rom_mmu_map(mapped_page_address, page_base, num_pages) };
         if rc != 0 {
+            let mut state = MMAP_STATE.irqsave_lock();
             state.live_handle = None;
+            state.busy = false;
             return Err(MapError::OutOfRange);
         }
-        // Also register the D-bus (DROM) view of the same pages so the image is
-        // readable as data. C3's shared table lands this on the same entries as
-        // the I-bus call above; the D-bus call just wires up the D-bus window.
+        // Wire up the D-bus (DROM) view too — see module doc on the shared table.
         let drom_vaddr = DROM_VADDR_BASE.wrapping_add(page_base);
         let rc_d = unsafe { esp32_rom::rom_mmu_map_d(drom_vaddr, page_base, num_pages) };
         if rc_d != 0 {
-            // Roll back the I-bus entries just programmed, then release the handle.
             let mut v = mapped_page_address;
             for _ in 0..num_pages {
                 let entry_id = (v & 0x7F_FFFF) >> 16;
                 unsafe { esp32_rom::rom_mmu_unmap(entry_id) };
                 v += FLASH_MMU_PAGE_SIZE;
             }
+            unsafe {
+                esp32_rom::rom_invalidate_icache_all();
+            }
+            instruction_fence();
+            let mut state = MMAP_STATE.irqsave_lock();
             state.live_handle = None;
+            state.busy = false;
             return Err(MapError::OutOfRange);
         }
     }
@@ -167,6 +176,10 @@ pub fn map_exec(physical_offset: u32, size: usize) -> Result<ExecMapping, MapErr
     }
     instruction_fence();
 
+    {
+        let mut state = MMAP_STATE.irqsave_lock();
+        state.busy = false;
+    }
     Ok(ExecMapping {
         segment_address: segment_address as usize,
         mapped_page_address: mapped_page_address as usize,
@@ -177,34 +190,40 @@ pub fn map_exec(physical_offset: u32, size: usize) -> Result<ExecMapping, MapErr
     })
 }
 
-/// Release a mapping. Caller MUST not be executing inside the mapped region.
 pub fn unmap_exec(mapping: &ExecMapping) -> Result<(), MapError> {
-    let mut state = MMAP_STATE.lock();
-    match state.live_handle {
-        Some(h) if h == mapping.handle => {
-            state.live_handle = None;
-            #[cfg(not(test))]
-            {
-                let num_pages = (mapping.mapped_size / FLASH_MMU_PAGE_SIZE as usize) as u32;
-                let mut vaddr = mapping.mapped_page_address as u32;
-                // One write per entry clears both I-bus and D-bus views: C3's
-                // shared table resolves the IROM and DROM vaddrs to the same
-                // entry, so the D-bus mapping installed in map_exec is gone too.
-                for _ in 0..num_pages {
-                    let entry_id = (vaddr & 0x7F_FFFF) >> 16;
-                    unsafe { esp32_rom::rom_mmu_unmap(entry_id) };
-                    vaddr += FLASH_MMU_PAGE_SIZE;
-                }
-            }
-            unsafe {
-                esp32_rom::rom_invalidate_icache_all();
-            }
-            instruction_fence();
-            Ok(())
+    {
+        let mut state = MMAP_STATE.irqsave_lock();
+        if state.busy {
+            return Err(MapError::InvalidHandle);
         }
-        Some(_) => Err(MapError::InvalidHandle),
-        None => Err(MapError::InvalidHandle),
+        match state.live_handle {
+            Some(h) if h == mapping.handle => {
+                state.busy = true;
+            }
+            Some(_) | None => return Err(MapError::InvalidHandle),
+        }
     }
+    #[cfg(not(test))]
+    {
+        let num_pages = (mapping.mapped_size / FLASH_MMU_PAGE_SIZE as usize) as u32;
+        let mut vaddr = mapping.mapped_page_address as u32;
+        // One write per entry clears both I-bus and D-bus views (shared table; see module doc).
+        for _ in 0..num_pages {
+            let entry_id = (vaddr & 0x7F_FFFF) >> 16;
+            unsafe { esp32_rom::rom_mmu_unmap(entry_id) };
+            vaddr += FLASH_MMU_PAGE_SIZE;
+        }
+    }
+    unsafe {
+        esp32_rom::rom_invalidate_icache_all();
+    }
+    instruction_fence();
+    {
+        let mut state = MMAP_STATE.irqsave_lock();
+        state.live_handle = None;
+        state.busy = false;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -258,16 +277,27 @@ mod tests {
 
     #[test]
     fn check_range_rejects_below_base() {
-        assert_eq!(check_loadable_range(base() - 1, base()), Err(MapError::OutOfRange));
+        assert_eq!(
+            check_loadable_range(base() - 1, base()),
+            Err(MapError::OutOfRange)
+        );
     }
 
     #[test]
     fn check_range_rejects_past_end() {
-        assert_eq!(check_loadable_range(end(), end() + 1), Err(MapError::OutOfRange));
+        assert_eq!(
+            check_loadable_range(end(), end() + 1),
+            Err(MapError::OutOfRange)
+        );
         assert_eq!(
             check_loadable_range(end() - 1, end() + 1),
             Err(MapError::OutOfRange)
         );
+    }
+
+    #[test]
+    fn physical_flash_offset_maps_to_expected_irom_address() {
+        assert_eq!(physical_to_irom_vaddr(0x0020_0000), Ok(0x4220_0000));
     }
 
     #[test]
@@ -400,5 +430,6 @@ mod tests {
         let mut s = MMAP_STATE.lock();
         s.live_handle = None;
         s.next_handle = 1;
+        s.busy = false;
     }
 }

@@ -13,13 +13,18 @@
 // limitations under the License.
 
 //! ESP32-C3 on-chip flash loadable-image Misc device.
+//!
+//! Mechanism only: erase/program/read + stateless executable mapping. The device
+//! holds no image semantics (no Ready state, no image_size, no CRC, no ELF
+//! knowledge). Persisted metadata + verification + recovery live in userspace.
 
 use crate::{
     devices::{Device, DeviceClass, DeviceId, DeviceManager},
     drivers::flash::{
-        esp32_rom, flash_mmap::{self, ExecMapping, MapError},
+        flash_mmap::{self, ExecMapping, MapError},
         internal_flash::{
-            with_internal_flash, EspFlashError, ESP_FLASH_SECTOR_SIZE, ESP_FLASH_WORD_SIZE,
+            with_internal_flash, with_internal_flash_exclusive, EspFlashError,
+            ESP_FLASH_SECTOR_SIZE,
         },
     },
     sync::SpinLock,
@@ -30,30 +35,45 @@ use embedded_io::ErrorKind;
 pub const ESP32_FLASH_DEVICE_NAME: &str = "esp32-flash0";
 
 // device-specific ioctl commands.
-pub const ESP32_FLASH_PREPARE: u32 = 0x40;
-pub const ESP32_FLASH_FINALIZE: u32 = 0x41;
-pub const ESP32_FLASH_ABORT: u32 = 0x42;
-pub const ESP32_FLASH_CLEAR: u32 = 0x43;
-pub const ESP32_FLASH_MAP: u32 = 0x44;
+pub const ESP32_FLASH_ERASE_RANGE: u32 = 0x40;
+pub const ESP32_FLASH_MAP_EXEC: u32 = 0x44;
 pub const ESP32_FLASH_UNMAP: u32 = 0x45;
-// Local/experimental: not merged to mainline. Returns the kernel DRAM safe base
-// (__sys_stack_end) so the userspace loader knows where free SRAM begins for
-// copying out-of-window RW segments at load time.
+pub const FLASH_IOCTL_ABI_VERSION: u32 = 1;
+// Returns __sys_stack_end: the safe SRAM base above kernel heap/stack, below
+// which the loader may copy out-of-window RW segments. Bounds copy_rw_segments.
 pub const ESP32_FLASH_QUERY_DRAM_SAFE: u32 = 0x46;
-// Local/diagnostic: reads 4 bytes back through the arg out-pointer to localize
-// the 0x4220185E illegal-instruction trap. Read-only, no device state change.
-pub const ESP32_FLASH_PROBE_LMA: u32 = 0x47;
-// Local/diagnostic: Ready-state counterpart of 0x47. Reads only the two physical
-// bytes (trap 0x2014C ctrl + 0x20185C) + their rom_read rc, no vaddr reads (map
-// has not run yet, so dbus/ibus are unmapped). Breaks the verify 0x01 inference
-// by reading the byte directly post-install/pre-map.
-pub const ESP32_FLASH_PROBE_LMA_RAW: u32 = 0x48;
+pub use crate::boards::{LOADABLE_REGION_BASE, LOADABLE_REGION_END, LOADABLE_REGION_SIZE};
 
-// Loadable Region: factory partition end .. 4 MB flash end.
-// Single source of truth; partition table `factory` end MUST equal LOADABLE_REGION_BASE.
-pub const LOADABLE_REGION_BASE: u32 = 0x0011_0000;
-pub const LOADABLE_REGION_SIZE: u32 = 0x002F_0000;
-pub const LOADABLE_REGION_END: u32 = LOADABLE_REGION_BASE + LOADABLE_REGION_SIZE;
+#[repr(C)]
+struct MapExecRequest {
+    version: u32,
+    size: u32,
+    flags: u32,
+    region_offset: u32,
+    image_size: u32,
+    mapped_address: u32,
+}
+
+#[repr(C)]
+struct EraseRangeRequest {
+    version: u32,
+    size: u32,
+    flags: u32,
+    region_offset: u32,
+    length: u32,
+}
+
+fn validate_request_header(
+    version: u32,
+    size: u32,
+    flags: u32,
+    expected_size: u32,
+) -> Result<(), ErrorKind> {
+    if version != FLASH_IOCTL_ABI_VERSION || size != expected_size || flags != 0 {
+        return Err(ErrorKind::InvalidInput);
+    }
+    Ok(())
+}
 
 /// Fixed on-chip flash region; callers use relative offsets.
 #[derive(Debug, Clone, Copy)]
@@ -76,8 +96,9 @@ impl InternalFlashRegion {
     }
 
     pub fn absolute_offset(&self, relative_offset: u32, len: usize) -> Result<u32, EspFlashError> {
+        let len = u32::try_from(len).map_err(|_| EspFlashError::OutOfBounds)?;
         let relative_end = relative_offset
-            .checked_add(len as u32)
+            .checked_add(len)
             .ok_or(EspFlashError::OutOfBounds)?;
         if relative_end > self.size {
             return Err(EspFlashError::OutOfBounds);
@@ -106,44 +127,24 @@ impl InternalFlashRegion {
     }
 }
 
-fn align_up_sector(value: u32) -> Result<u32, EspFlashError> {
-    let sector = ESP_FLASH_SECTOR_SIZE as u32;
-    value
-        .checked_add(sector - 1)
-        .map(|v| v / sector * sector)
-        .ok_or(EspFlashError::OutOfBounds)
-}
-
 #[derive(Debug)]
-enum Esp32FlashImageState {
+enum Esp32FlashState {
     Idle,
-    Prepared {
-        expected_size: u32,
-        received_size: u32,
-        programmed_size: u32,
-        tail: [u8; 4],
-        tail_len: usize,
-    },
-    Ready {
-        image_size: u32,
-    },
-    Mapped {
-        mapping: ExecMapping,
-        image_size: u32,
-    },
+    Busy,
+    Mapped { mapping: ExecMapping },
 }
 
-impl Default for Esp32FlashImageState {
+impl Default for Esp32FlashState {
     fn default() -> Self {
-        Esp32FlashImageState::Idle
+        Self::Idle
     }
 }
 
-/// Misc device wrapping a fixed flash region. State is locked (Device::write is &self).
+/// Misc device exposing a fixed partition-like region of on-chip flash.
 pub struct Esp32FlashDevice {
     name: String,
     region: InternalFlashRegion,
-    state: SpinLock<Esp32FlashImageState>,
+    state: SpinLock<Esp32FlashState>,
 }
 
 impl Esp32FlashDevice {
@@ -151,390 +152,150 @@ impl Esp32FlashDevice {
         Self {
             name: String::from(name),
             region,
-            state: SpinLock::new(Esp32FlashImageState::Idle),
+            state: SpinLock::new(Esp32FlashState::Idle),
         }
     }
 
-    /// PREPARE: erase region, reset counters, go Prepared.
-    fn ioctl_prepare(&self, image_size: usize) -> Result<(), ErrorKind> {
-        if image_size == 0 {
-            return Err(ErrorKind::InvalidInput);
+    fn begin_flash_operation(&self) -> Result<(), ErrorKind> {
+        let mut state = self.state.irqsave_lock();
+        match &*state {
+            Esp32FlashState::Idle => {
+                *state = Esp32FlashState::Busy;
+                Ok(())
+            }
+            Esp32FlashState::Mapped { .. } => Err(ErrorKind::PermissionDenied),
+            Esp32FlashState::Busy => Err(ErrorKind::Other),
         }
-        if image_size as u64 > self.region.size() as u64 {
-            return Err(ErrorKind::InvalidInput);
-        }
-        let erase_len = align_up_sector(image_size as u32).map_err(|_| ErrorKind::InvalidInput)?;
-        let erase_len = core::cmp::min(erase_len, self.region.size());
+    }
 
-        let mut state = self.state.lock();
-        if !matches!(*state, Esp32FlashImageState::Idle) {
-            // Mapped refuses reinstall; other non-Idle is a usage error.
-            let err = match &*state {
-                Esp32FlashImageState::Mapped { .. } => ErrorKind::PermissionDenied,
-                _ => ErrorKind::InvalidInput,
-            };
-            return Err(err);
+    fn finish_flash_operation(&self) {
+        *self.state.irqsave_lock() = Esp32FlashState::Idle;
+    }
+
+    fn ioctl_erase_range(&self, arg: usize) -> Result<(), ErrorKind> {
+        if arg == 0 || arg % core::mem::align_of::<EraseRangeRequest>() != 0 {
+            return Err(ErrorKind::InvalidInput);
         }
-        with_internal_flash(|flash| flash.erase_region(self.region.base(), erase_len))
+
+        let req = unsafe { core::ptr::read_volatile(arg as *const EraseRangeRequest) };
+        validate_request_header(
+            req.version,
+            req.size,
+            req.flags,
+            core::mem::size_of::<EraseRangeRequest>() as u32,
+        )?;
+        if req.length == 0
+            || req.region_offset % ESP_FLASH_SECTOR_SIZE as u32 != 0
+            || req.length % ESP_FLASH_SECTOR_SIZE as u32 != 0
+        {
+            return Err(ErrorKind::InvalidInput);
+        }
+        let physical = self
+            .region
+            .absolute_offset(req.region_offset, req.length as usize)
             .map_err(map_flash_err)?;
 
-        *state = Esp32FlashImageState::Prepared {
-            expected_size: image_size as u32,
-            received_size: 0,
-            programmed_size: 0,
-            tail: [0u8; 4],
-            tail_len: 0,
-        };
-        Ok(())
+        self.begin_flash_operation()?;
+        let result = with_internal_flash(|flash| flash.erase_region(physical, req.length))
+            .map_err(map_flash_err);
+        self.finish_flash_operation();
+        result
     }
 
-    /// FINALIZE: pad tail with 0xFF, write last word, go Ready.
-    fn ioctl_finalize(&self) -> Result<(), ErrorKind> {
-        let mut state = self.state.lock();
-        let (expected_size, received_size, programmed_size, tail, tail_len) = match &*state {
-            Esp32FlashImageState::Prepared {
-                expected_size,
-                received_size,
-                programmed_size,
-                tail,
-                tail_len,
-            } => (
-                *expected_size,
-                *received_size,
-                *programmed_size,
-                *tail,
-                *tail_len,
-            ),
-            Esp32FlashImageState::Mapped { .. } => return Err(ErrorKind::PermissionDenied),
-            _ => return Err(ErrorKind::InvalidInput),
-        };
-        if received_size != expected_size {
-            return Err(ErrorKind::InvalidInput);
-        }
-
-        if tail_len > 0 {
-            let mut tail = tail;
-            for b in tail[tail_len..].iter_mut() {
-                *b = 0xFF;
-            }
-            let phys_off = self
-                .region
-                .absolute_offset(programmed_size, ESP_FLASH_WORD_SIZE)
-                .map_err(|_| ErrorKind::InvalidInput)?;
-            with_internal_flash(|flash| flash.program_aligned(phys_off, &tail[..]))
-                .map_err(map_flash_err)?;
-        }
-
-        *state = Esp32FlashImageState::Ready {
-            image_size: expected_size,
-        };
-        Ok(())
-    }
-
-    /// ABORT: drop state, back to Idle. Refused while Mapped (unmap first).
-    fn ioctl_abort(&self) -> Result<(), ErrorKind> {
-        let mut state = self.state.lock();
-        if matches!(*state, Esp32FlashImageState::Mapped { .. }) {
-            return Err(ErrorKind::PermissionDenied);
-        }
-        *state = Esp32FlashImageState::Idle;
-        Ok(())
-    }
-
-    /// CLEAR: deferred; only resets state for now. Refused while Mapped (unmap first).
-    fn ioctl_clear(&self) -> Result<(), ErrorKind> {
-        let mut state = self.state.lock();
-        if matches!(*state, Esp32FlashImageState::Mapped { .. }) {
-            return Err(ErrorKind::PermissionDenied);
-        }
-        *state = Esp32FlashImageState::Idle;
-        Ok(())
-    }
-
-    /// Sequential write with 4-byte tail cache.
     fn write_data(&self, pos: u64, buf: &[u8]) -> Result<usize, ErrorKind> {
         if buf.is_empty() {
             return Ok(0);
         }
-        let mut state = self.state.lock();
-        let (expected_size, mut received_size, mut programmed_size, mut tail, mut tail_len) =
-            match &*state {
-                Esp32FlashImageState::Prepared {
-                    expected_size,
-                    received_size,
-                    programmed_size,
-                    tail,
-                    tail_len,
-                } => (
-                    *expected_size,
-                    *received_size,
-                    *programmed_size,
-                    *tail,
-                    *tail_len,
-                ),
-                Esp32FlashImageState::Mapped { .. } => return Err(ErrorKind::PermissionDenied),
-                _ => return Err(ErrorKind::InvalidInput),
-            };
-
-        if pos != received_size as u64 {
-            return Err(ErrorKind::InvalidInput);
-        }
-        if (received_size as u64)
-            .checked_add(buf.len() as u64)
-            .map_or(true, |end| end > expected_size as u64)
-        {
-            return Err(ErrorKind::InvalidInput);
-        }
-
-        let mut consumed = 0usize;
-        let data = buf;
-
-        // 1. Fill pending tail to a full word first.
-        if tail_len > 0 {
-            let need = ESP_FLASH_WORD_SIZE - tail_len;
-            let take = core::cmp::min(need, data.len());
-            tail[tail_len..tail_len + take].copy_from_slice(&data[..take]);
-            tail_len += take;
-            consumed += take;
-            if tail_len == ESP_FLASH_WORD_SIZE {
-                let phys_off = self
-                    .region
-                    .absolute_offset(programmed_size, ESP_FLASH_WORD_SIZE)
-                    .map_err(|_| ErrorKind::InvalidInput)?;
-                with_internal_flash(|flash| flash.program_aligned(phys_off, &tail[..]))
-                    .map_err(map_flash_err)?;
-                programmed_size += ESP_FLASH_WORD_SIZE as u32;
-                tail_len = 0;
-            }
-        }
-
-        // 2. Write word-aligned middle in <=256B chunks.
-        let middle_end = consumed + ((data.len() - consumed) & !(ESP_FLASH_WORD_SIZE - 1));
-        while consumed < middle_end {
-            let n = core::cmp::min(256, middle_end - consumed);
-            let phys_off = self
-                .region
-                .absolute_offset(programmed_size, n)
-                .map_err(|_| ErrorKind::InvalidInput)?;
-            with_internal_flash(|flash| {
-                flash.program_aligned(phys_off, &data[consumed..consumed + n])
-            })
+        let relative = u32::try_from(pos).map_err(|_| ErrorKind::InvalidInput)?;
+        let physical = self
+            .region
+            .absolute_offset(relative, buf.len())
             .map_err(map_flash_err)?;
-            programmed_size += n as u32;
-            consumed += n;
-        }
 
-        // 3. Stash remaining <4 bytes in tail.
-        if consumed < data.len() {
-            let rem = data.len() - consumed;
-            tail[..rem].copy_from_slice(&data[consumed..consumed + rem]);
-            tail_len = rem;
-            consumed += rem;
-        }
-
-        received_size += consumed as u32;
-
-        match &mut *state {
-            Esp32FlashImageState::Prepared {
-                received_size: rs,
-                programmed_size: ps,
-                tail: t,
-                tail_len: tl,
-                ..
-            } => {
-                *rs = received_size;
-                *ps = programmed_size;
-                *t = tail;
-                *tl = tail_len;
-            }
-            _ => return Err(ErrorKind::InvalidInput),
-        }
-
-        Ok(consumed)
+        self.begin_flash_operation()?;
+        let result = with_internal_flash(|flash| flash.write(physical, buf)).map_err(map_flash_err);
+        self.finish_flash_operation();
+        result.map(|_| buf.len())
     }
 
-    /// MAP: map the whole Ready image as executable, go Mapped. When `arg` is a
-    /// non-null `*mut u32` from userspace, write the segment address back so the
-    /// caller can transmute it into an entry pointer. arg==0 means "don't care".
-    fn ioctl_map(&self, arg: usize) -> Result<(), ErrorKind> {
-        let mut state = self.state.lock();
-        let image_size = match &*state {
-            Esp32FlashImageState::Ready { image_size } => *image_size,
-            Esp32FlashImageState::Mapped { .. } => return Err(ErrorKind::PermissionDenied),
-            _ => return Err(ErrorKind::InvalidInput),
-        };
-        // Fixed mapping: entire image at region base (single live mapping).
-        let mapping =
-            flash_mmap::map_exec(self.region.base(), image_size as usize).map_err(map_mmap_err)?;
-        if arg != 0 {
-            // SAFETY: caller (userspace) passes a valid writable u32. No kernel
-            // copy_to_user helper exists; the tmpfs ioctl bridge passes arg
-            // through unchecked, matching existing ioctl conventions.
-            unsafe { *(arg as *mut u32) = mapping.segment_address as u32 };
+    /// Map a region-relative flash range as executable.
+    fn ioctl_map_exec(&self, arg: usize) -> Result<(), ErrorKind> {
+        if arg == 0 || arg % core::mem::align_of::<MapExecRequest>() != 0 {
+            return Err(ErrorKind::InvalidInput);
         }
-        *state = Esp32FlashImageState::Mapped {
-            mapping,
-            image_size,
+
+        let req = unsafe { core::ptr::read_volatile(arg as *const MapExecRequest) };
+        validate_request_header(
+            req.version,
+            req.size,
+            req.flags,
+            core::mem::size_of::<MapExecRequest>() as u32,
+        )?;
+        let size = usize::try_from(req.image_size).map_err(|_| ErrorKind::InvalidInput)?;
+        if size == 0 {
+            return Err(ErrorKind::InvalidInput);
+        }
+        let physical = self
+            .region
+            .absolute_offset(req.region_offset, size)
+            .map_err(map_flash_err)?;
+
+        self.begin_flash_operation()?;
+        let mapping = match with_internal_flash_exclusive(|| flash_mmap::map_exec(physical, size)) {
+            Ok(Ok(mapping)) => mapping,
+            Ok(Err(error)) => {
+                self.finish_flash_operation();
+                return Err(map_mmap_err(error));
+            }
+            Err(error) => {
+                self.finish_flash_operation();
+                return Err(map_flash_err(error));
+            }
         };
+
+        unsafe {
+            let out = core::ptr::addr_of_mut!((*(arg as *mut MapExecRequest)).mapped_address);
+            core::ptr::write_volatile(out, mapping.segment_address as u32);
+        }
+        *self.state.irqsave_lock() = Esp32FlashState::Mapped { mapping };
         Ok(())
     }
 
-    /// UNMAP: release mapping, back to Ready. Caller MUST not execute in region.
+    /// Release the executable mapping. Caller must not execute in the range.
     fn ioctl_unmap(&self) -> Result<(), ErrorKind> {
-        let mut state = self.state.lock();
-        let old = core::mem::replace(&mut *state, Esp32FlashImageState::Idle);
-        let (mapping, image_size) = match old {
-            Esp32FlashImageState::Mapped {
-                mapping,
-                image_size,
-            } => (mapping, image_size),
+        let mut state = self.state.irqsave_lock();
+        let old = core::mem::replace(&mut *state, Esp32FlashState::Busy);
+        let mapping = match old {
+            Esp32FlashState::Mapped { mapping } => mapping,
             other => {
                 *state = other;
                 return Err(ErrorKind::InvalidInput);
             }
         };
-        // Set Ready before calling flash_mmap to avoid nesting state lock inside MMAP_STATE.
-        *state = Esp32FlashImageState::Ready { image_size };
         drop(state);
-        match flash_mmap::unmap_exec(&mapping).map_err(map_mmap_err) {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                // Roll back: keep mapping live so caller can retry.
-                let mut state = self.state.lock();
-                *state = Esp32FlashImageState::Mapped {
-                    mapping,
-                    image_size,
-                };
-                Err(e)
+        let result = with_internal_flash_exclusive(|| flash_mmap::unmap_exec(&mapping));
+        match result {
+            Ok(Ok(())) => {
+                self.finish_flash_operation();
+                Ok(())
+            }
+            Ok(Err(error)) => {
+                *self.state.irqsave_lock() = Esp32FlashState::Mapped { mapping };
+                Err(map_mmap_err(error))
+            }
+            Err(error) => {
+                *self.state.irqsave_lock() = Esp32FlashState::Mapped { mapping };
+                Err(map_flash_err(error))
             }
         }
     }
 
-    /// QUERY_DRAM_SAFE: write the kernel DRAM safe base (__sys_stack_end) to the
-    /// caller's *mut u32 so the loader knows where free SRAM for RW segments
-    /// begins. Local/experimental ioctl, not merged to mainline. Read-only symbol
-    /// query, independent of device state, so no state lock needed.
+    /// Write __sys_stack_end (free-SRAM base for RW segments) to the caller's
+    /// *mut u32. Read-only query, independent of device state, so no state lock.
     fn ioctl_query_dram_safe(&self, arg: usize) -> Result<(), ErrorKind> {
         if arg != 0 {
-            // SAFETY: caller passes a valid writable u32 (tmpfs ioctl bridge passes
-            // arg through unchecked, matching existing ioctl_map conventions).
-            // addr_of! avoids borrowing a `static mut` (static_mut_refs lint);
-            // boot.rs uses the same idiom for these linker symbols.
             let safe = core::ptr::addr_of!(crate::boot::__sys_stack_end) as u32;
             unsafe { *(arg as *mut u32) = safe };
-        }
-        Ok(())
-    }
-
-    /// PROBE_LMA: diagnostic. Reads 7 values at the known trap point and writes
-    /// them back through the arg out-pointer so the loader can print them. Read-
-    /// only, independent of device state, so no state lock. Local/diagnostic,
-    /// not merged to mainline.
-    fn ioctl_probe_lma(&self, arg: usize) -> Result<(), ErrorKind> {
-        // Fixed trap point: vaddr 0x4220185E, MMU entry 32, physical 0x20185E,
-        // D-bus view 0x3C20185E. All derived from the observed illegal-instr trap.
-        // Control point: physical 0x2014C = main's first instruction (addi sp,sp,-544
-        // = 0x130101de, low byte 0x13), which main() executed, so it must read 0x13
-        // post-map. Pairs with the trap byte to tell whether rom_read is trustworthy
-        // after the page is mapped.
-        const TRAP_VADDR: u32 = 0x4220_185E;
-        const TRAP_ENTRY: u32 = 32;
-        const TRAP_PHYS: u32 = 0x0020_185E;
-        const TRAP_DBUS: u32 = 0x3C20_185E;
-        const CTRL_PHYS: u32 = 0x0020_014C;
-
-        let entry32 = unsafe { esp32_rom::rom_mmu_entry_read(TRAP_ENTRY) };
-
-        // Cache-bypass physical read of one word. rom_read wants a word-aligned
-        // buffer; read 4 bytes and take the target byte. rc is propagated (0=OK,
-        // 1=ERR, 2=TIMEOUT) so a 0xFF byte can be told apart from a failed call
-        // that left the buffer untouched.
-        let read_phys_byte = |phys: u32, rc_out: &mut u32| -> u32 {
-            let mut word: u32 = 0xFFFF_FFFF;
-            let rc = unsafe {
-                esp32_rom::rom_read(
-                    phys & !0x3,
-                    &mut word as *mut u32 as *const u32,
-                    4,
-                )
-            };
-            *rc_out = rc as u32;
-            (word >> ((phys & 0x3) * 8)) as u8 as u32
-        };
-        let mut trap_rc: u32 = 0;
-        let mut ctrl_rc: u32 = 0;
-        let trap_phys = read_phys_byte(TRAP_PHYS, &mut trap_rc);
-        let ctrl_phys = read_phys_byte(CTRL_PHYS, &mut ctrl_rc);
-
-        // D-bus and I-bus vaddr reads go through the Flash MMU + ICache (the same
-        // path fetch uses), so a 0xFF here is the real trap signal.
-        // SAFETY: map_exec has run and invalidated ICache; the vaddr is mapped.
-        // A load does not trap on illegal instruction data; an unmapped entry
-        // would raise access-fault (also useful diagnostic), so this never hangs.
-        let dbus_byte = unsafe { core::ptr::read_volatile(TRAP_DBUS as *const u8) as u32 };
-        let ibus_byte = unsafe { core::ptr::read_volatile(TRAP_VADDR as *const u8) as u32 };
-
-        if arg != 0 {
-            // SAFETY: caller passes a valid writable 28-byte ProbeResult; the VFS
-            // ioctl bridge passes arg through unchecked (same as ioctl_map).
-            let out: [u32; 7] = [
-                entry32,
-                trap_phys,
-                trap_rc,
-                ctrl_phys,
-                ctrl_rc,
-                dbus_byte,
-                ibus_byte,
-            ];
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    out.as_ptr(),
-                    arg as *mut u32,
-                    out.len(),
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// PROBE_LMA_RAW: Ready-state diagnostic. Same hardcoded physical reads as
-    /// ioctl_probe_lma but skips the vaddr reads (map has not run, so dbus/ibus
-    /// are unmapped and would access-fault). Reads trap (0x20185C) + ctrl
-    /// (0x2014C) physical bytes and their rom_read rc, so the caller can compare
-    /// the byte post-install/pre-map against the post-map probe. Read-only,
-    /// independent of device state, no state lock. Local/diagnostic, not mainline.
-    fn ioctl_probe_lma_raw(&self, arg: usize) -> Result<(), ErrorKind> {
-        const TRAP_PHYS: u32 = 0x0020_185C;
-        const CTRL_PHYS: u32 = 0x0020_014C;
-
-        let read_phys_byte = |phys: u32, rc_out: &mut u32| -> u32 {
-            let mut word: u32 = 0xFFFF_FFFF;
-            let rc = unsafe {
-                esp32_rom::rom_read(
-                    phys & !0x3,
-                    &mut word as *mut u32 as *const u32,
-                    4,
-                )
-            };
-            *rc_out = rc as u32;
-            (word >> ((phys & 0x3) * 8)) as u8 as u32
-        };
-        let mut trap_rc: u32 = 0;
-        let mut ctrl_rc: u32 = 0;
-        let trap_phys = read_phys_byte(TRAP_PHYS, &mut trap_rc);
-        let ctrl_phys = read_phys_byte(CTRL_PHYS, &mut ctrl_rc);
-
-        if arg != 0 {
-            // SAFETY: caller passes a valid writable 16-byte ProbeRaw; the VFS
-            // ioctl bridge passes arg through unchecked (same as ioctl_map).
-            let out: [u32; 4] = [trap_phys, trap_rc, ctrl_phys, ctrl_rc];
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    out.as_ptr(),
-                    arg as *mut u32,
-                    out.len(),
-                );
-            }
         }
         Ok(())
     }
@@ -554,25 +315,25 @@ impl Device for Esp32FlashDevice {
     }
 
     fn read(&self, pos: u64, buf: &mut [u8], _is_nonblocking: bool) -> Result<usize, ErrorKind> {
-        let image_size = match &*self.state.lock() {
-            Esp32FlashImageState::Ready { image_size } => *image_size,
-            Esp32FlashImageState::Mapped { image_size, .. } => *image_size,
-            _ => return Err(ErrorKind::Other),
-        };
-        if pos >= image_size as u64 {
+        if matches!(*self.state.irqsave_lock(), Esp32FlashState::Busy) {
+            return Err(ErrorKind::Other);
+        }
+        if pos >= self.region.size() as u64 {
             return Ok(0);
         }
-        let avail = (image_size as u64).saturating_sub(pos);
-        let n = core::cmp::min(buf.len() as u64, avail) as usize;
-        if n == 0 {
+        let available = self.region.size() as u64 - pos;
+        let count = core::cmp::min(buf.len() as u64, available) as usize;
+        if count == 0 {
             return Ok(0);
         }
-        let phys_off = self
+        let relative = u32::try_from(pos).map_err(|_| ErrorKind::InvalidInput)?;
+        let physical = self
             .region
-            .absolute_offset(pos as u32, n)
-            .map_err(|_| ErrorKind::InvalidInput)?;
-        with_internal_flash(|flash| flash.read(phys_off, &mut buf[..n])).map_err(map_flash_err)?;
-        Ok(n)
+            .absolute_offset(relative, count)
+            .map_err(map_flash_err)?;
+        with_internal_flash(|flash| flash.read(physical, &mut buf[..count]))
+            .map_err(map_flash_err)?;
+        Ok(count)
     }
 
     fn write(&self, pos: u64, buf: &[u8], _is_nonblocking: bool) -> Result<usize, ErrorKind> {
@@ -581,15 +342,10 @@ impl Device for Esp32FlashDevice {
 
     fn ioctl(&self, request: u32, arg: usize) -> Result<(), ErrorKind> {
         match request {
-            ESP32_FLASH_PREPARE => self.ioctl_prepare(arg),
-            ESP32_FLASH_FINALIZE => self.ioctl_finalize(),
-            ESP32_FLASH_ABORT => self.ioctl_abort(),
-            ESP32_FLASH_CLEAR => self.ioctl_clear(),
-            ESP32_FLASH_MAP => self.ioctl_map(arg),
+            ESP32_FLASH_ERASE_RANGE => self.ioctl_erase_range(arg),
+            ESP32_FLASH_MAP_EXEC => self.ioctl_map_exec(arg),
             ESP32_FLASH_UNMAP => self.ioctl_unmap(),
             ESP32_FLASH_QUERY_DRAM_SAFE => self.ioctl_query_dram_safe(arg),
-            ESP32_FLASH_PROBE_LMA => self.ioctl_probe_lma(arg),
-            ESP32_FLASH_PROBE_LMA_RAW => self.ioctl_probe_lma_raw(arg),
             _ => Err(ErrorKind::Unsupported),
         }
     }
@@ -646,193 +402,156 @@ pub fn init_esp32_flash_device() -> Result<(), ErrorKind> {
 mod tests {
     use super::*;
 
+    fn region() -> InternalFlashRegion {
+        InternalFlashRegion::new(LOADABLE_REGION_BASE, LOADABLE_REGION_SIZE)
+    }
+
+    fn map_request(region_offset: u32, image_size: u32) -> MapExecRequest {
+        MapExecRequest {
+            version: FLASH_IOCTL_ABI_VERSION,
+            size: core::mem::size_of::<MapExecRequest>() as u32,
+            flags: 0,
+            region_offset,
+            image_size,
+            mapped_address: 0,
+        }
+    }
+
     #[test]
     fn region_absolute_offset_basic() {
-        let r = InternalFlashRegion::new(0x0011_0000, 0x0010_0000);
-        assert_eq!(r.absolute_offset(0, 0).unwrap(), 0x0011_0000);
-        assert_eq!(r.absolute_offset(0x100, 16).unwrap(), 0x0011_0100);
+        assert_eq!(region().absolute_offset(0, 0), Ok(LOADABLE_REGION_BASE));
+        assert_eq!(
+            region().absolute_offset(0x000F_0000, 0x1CFC),
+            Ok(0x0020_0000)
+        );
     }
 
     #[test]
     fn region_absolute_offset_rejects_overflow() {
-        let r = InternalFlashRegion::new(0x0011_0000, 0x0010_0000);
         assert_eq!(
-            r.absolute_offset(0x0010_0000, 1),
+            region().absolute_offset(LOADABLE_REGION_SIZE, 1),
             Err(EspFlashError::OutOfBounds)
         );
-        assert!(r.absolute_offset(0x000F_FFFC, 4).is_ok());
+        assert!(region()
+            .absolute_offset(LOADABLE_REGION_SIZE - 4, 4)
+            .is_ok());
         assert_eq!(
-            r.absolute_offset(0x000F_FFFC, 5),
+            region().absolute_offset(LOADABLE_REGION_SIZE - 4, 5),
+            Err(EspFlashError::OutOfBounds)
+        );
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn region_absolute_offset_rejects_usize_length_narrowing() {
+        let len = usize::try_from(u64::from(u32::MAX) + 1).unwrap();
+        assert_eq!(
+            region().absolute_offset(0, len),
             Err(EspFlashError::OutOfBounds)
         );
     }
 
     #[test]
-    fn region_validate_accepts_aligned_in_range() {
-        let r = InternalFlashRegion::new(0x0011_0000, 0x0010_0000);
-        assert!(r.validate(0x0040_0000).is_ok());
+    fn region_validation_checks_alignment_and_capacity() {
+        assert!(region().validate(0x0040_0000).is_ok());
+        assert_eq!(
+            InternalFlashRegion::new(LOADABLE_REGION_BASE + 1, LOADABLE_REGION_SIZE)
+                .validate(0x0040_0000),
+            Err(EspFlashError::UnalignedErase)
+        );
+        assert_eq!(
+            InternalFlashRegion::new(LOADABLE_REGION_BASE, LOADABLE_REGION_SIZE + 1)
+                .validate(0x0040_0000),
+            Err(EspFlashError::UnalignedErase)
+        );
+        assert_eq!(
+            region().validate(LOADABLE_REGION_END - 1),
+            Err(EspFlashError::OutOfBounds)
+        );
     }
 
     #[test]
-    fn region_validate_rejects_unaligned_base() {
-        let r = InternalFlashRegion::new(0x0011_0001, 0x0010_0000);
-        assert_eq!(r.validate(0x0040_0000), Err(EspFlashError::UnalignedErase));
+    fn request_structs_use_versioned_abi_prefix() {
+        assert_eq!(core::mem::size_of::<MapExecRequest>(), 24);
+        assert_eq!(core::mem::offset_of!(MapExecRequest, version), 0);
+        assert_eq!(core::mem::offset_of!(MapExecRequest, size), 4);
+        assert_eq!(core::mem::offset_of!(MapExecRequest, flags), 8);
+        assert_eq!(core::mem::offset_of!(MapExecRequest, region_offset), 12);
+        assert_eq!(core::mem::offset_of!(MapExecRequest, image_size), 16);
+        assert_eq!(core::mem::offset_of!(MapExecRequest, mapped_address), 20);
+
+        assert_eq!(core::mem::size_of::<EraseRangeRequest>(), 20);
+        assert_eq!(core::mem::offset_of!(EraseRangeRequest, version), 0);
+        assert_eq!(core::mem::offset_of!(EraseRangeRequest, size), 4);
+        assert_eq!(core::mem::offset_of!(EraseRangeRequest, flags), 8);
+        assert_eq!(core::mem::offset_of!(EraseRangeRequest, region_offset), 12);
+        assert_eq!(core::mem::offset_of!(EraseRangeRequest, length), 16);
     }
 
     #[test]
-    fn region_validate_rejects_unaligned_size() {
-        let r = InternalFlashRegion::new(0x0011_0000, 0x0010_0001);
-        assert_eq!(r.validate(0x0040_0000), Err(EspFlashError::UnalignedErase));
+    fn request_header_checks_version_size_and_flags() {
+        let expected = core::mem::size_of::<MapExecRequest>() as u32;
+        assert_eq!(
+            validate_request_header(FLASH_IOCTL_ABI_VERSION, expected, 0, expected),
+            Ok(())
+        );
+        assert_eq!(
+            validate_request_header(FLASH_IOCTL_ABI_VERSION + 1, expected, 0, expected),
+            Err(ErrorKind::InvalidInput)
+        );
+        assert_eq!(
+            validate_request_header(FLASH_IOCTL_ABI_VERSION, expected - 4, 0, expected),
+            Err(ErrorKind::InvalidInput)
+        );
+        assert_eq!(
+            validate_request_header(FLASH_IOCTL_ABI_VERSION, expected, 1, expected),
+            Err(ErrorKind::InvalidInput)
+        );
     }
 
     #[test]
-    fn region_validate_rejects_past_capacity() {
-        let r = InternalFlashRegion::new(0x0030_0000, 0x0020_0000);
-        assert_eq!(r.validate(0x0040_0000), Err(EspFlashError::OutOfBounds));
-    }
-
-    #[test]
-    fn align_up_sector_basic() {
-        assert_eq!(align_up_sector(0).unwrap(), 0);
-        assert_eq!(align_up_sector(1).unwrap(), 4096);
-        assert_eq!(align_up_sector(4096).unwrap(), 4096);
-        assert_eq!(align_up_sector(4097).unwrap(), 8192);
-    }
-
-    #[test]
-    fn align_up_sector_overflow() {
-        assert_eq!(align_up_sector(u32::MAX), Err(EspFlashError::OutOfBounds));
-    }
-
-    #[test]
-    fn state_default_is_idle() {
-        assert!(matches!(
-            Esp32FlashImageState::default(),
-            Esp32FlashImageState::Idle
-        ));
-    }
-
-    #[test]
-    fn device_construct_keeps_idle() {
-        let region = InternalFlashRegion::new(0x0011_0000, 0x0010_0000);
-        let dev = Esp32FlashDevice::new("esp32-flash0", region);
-        assert!(matches!(*dev.state.lock(), Esp32FlashImageState::Idle));
-    }
-
-    #[test]
-    fn device_class_and_names() {
-        let region = InternalFlashRegion::new(0x0011_0000, 0x0010_0000);
-        let dev = Esp32FlashDevice::new("esp32-flash0", region);
-        assert_eq!(dev.name(), "esp32-flash0");
-        assert_eq!(dev.class(), DeviceClass::Misc);
-        assert_eq!(dev.capacity().unwrap(), 0x0010_0000);
-        assert_eq!(dev.sector_size().unwrap(), ESP_FLASH_SECTOR_SIZE as u16);
-    }
-
-    #[test]
-    fn read_rejects_not_ready() {
-        let region = InternalFlashRegion::new(0x0011_0000, 0x0010_0000);
-        let dev = Esp32FlashDevice::new("esp32-flash0", region);
-        let mut buf = [0u8; 8];
-        assert_eq!(dev.read(0, &mut buf, false), Err(ErrorKind::Other));
-    }
-
-    #[test]
-    fn write_rejects_not_prepared() {
-        let region = InternalFlashRegion::new(0x0011_0000, 0x0010_0000);
-        let dev = Esp32FlashDevice::new("esp32-flash0", region);
-        assert_eq!(dev.write(0, &[0u8; 8], false), Err(ErrorKind::InvalidInput));
-    }
-
-    // Helper: build a device whose state is forced to Mapped, bypassing the
-    // ROM/FFI path of ioctl_map (unavailable on host tests).
-    fn mapped_device(image_size: u32) -> Esp32FlashDevice {
-        let region = InternalFlashRegion::new(0x0011_0000, 0x0010_0000);
-        let dev = Esp32FlashDevice::new("esp32-flash0", region);
-        *dev.state.lock() = Esp32FlashImageState::Mapped {
+    fn mapped_state_rejects_flash_mutation() {
+        let dev = Esp32FlashDevice::new(ESP32_FLASH_DEVICE_NAME, region());
+        *dev.state.irqsave_lock() = Esp32FlashState::Mapped {
             mapping: ExecMapping::for_test(),
-            image_size,
         };
-        dev
-    }
-
-    #[test]
-    fn mapped_refuses_prepare() {
-        let dev = mapped_device(0x1000);
-        assert_eq!(dev.ioctl_prepare(0x1000), Err(ErrorKind::PermissionDenied));
-    }
-
-    #[test]
-    fn mapped_refuses_write() {
-        let dev = mapped_device(0x1000);
         assert_eq!(
-            dev.write(0, &[0u8; 8], false),
+            dev.begin_flash_operation(),
             Err(ErrorKind::PermissionDenied)
         );
     }
 
     #[test]
-    fn mapped_refuses_finalize() {
-        let dev = mapped_device(0x1000);
-        assert_eq!(dev.ioctl_finalize(), Err(ErrorKind::PermissionDenied));
-    }
+    fn map_exec_validates_request_before_hardware() {
+        let dev = Esp32FlashDevice::new(ESP32_FLASH_DEVICE_NAME, region());
 
-    #[test]
-    fn mapped_refuses_abort() {
-        let dev = mapped_device(0x1000);
-        assert_eq!(dev.ioctl_abort(), Err(ErrorKind::PermissionDenied));
-    }
-
-    #[test]
-    fn mapped_refuses_clear() {
-        let dev = mapped_device(0x1000);
-        assert_eq!(dev.ioctl_clear(), Err(ErrorKind::PermissionDenied));
-    }
-
-    #[test]
-    fn mapped_refuses_map() {
-        // Double-map at device layer must refuse even before hitting flash_mmap.
-        let dev = mapped_device(0x1000);
-        assert_eq!(dev.ioctl_map(0), Err(ErrorKind::PermissionDenied));
-    }
-
-    #[test]
-    fn map_rejects_not_ready() {
-        let region = InternalFlashRegion::new(0x0011_0000, 0x0010_0000);
-        let dev = Esp32FlashDevice::new("esp32-flash0", region);
-        // Idle: not Ready. Avoids the ROM path (state check happens first).
-        assert_eq!(dev.ioctl_map(0), Err(ErrorKind::InvalidInput));
-    }
-
-    #[test]
-    fn unmap_rejects_not_mapped() {
-        let region = InternalFlashRegion::new(0x0011_0000, 0x0010_0000);
-        let dev = Esp32FlashDevice::new("esp32-flash0", region);
-        assert_eq!(dev.ioctl_unmap(), Err(ErrorKind::InvalidInput));
-    }
-
-    #[test]
-    fn read_accepts_mapped() {
-        // Mapped state should allow read (XIP does not block reads). Probe the
-        // in-range/edge path without touching the real flash backend: pos ==
-        // image_size yields Ok(0) before any hardware call.
-        let dev = mapped_device(0x1000);
-        let mut buf = [0u8; 8];
-        assert_eq!(dev.read(0x1000, &mut buf, false), Ok(0));
-    }
-
-    #[test]
-    fn map_mmap_err_mapping() {
+        let mut zero = map_request(0, 0);
         assert_eq!(
-            map_mmap_err(MapError::AlreadyMapped),
-            ErrorKind::PermissionDenied
+            dev.ioctl_map_exec(&mut zero as *mut MapExecRequest as usize),
+            Err(ErrorKind::InvalidInput)
         );
-        assert_eq!(map_mmap_err(MapError::ZeroSize), ErrorKind::InvalidInput);
-        assert_eq!(map_mmap_err(MapError::OutOfRange), ErrorKind::InvalidInput);
-        assert_eq!(map_mmap_err(MapError::Overflow), ErrorKind::InvalidInput);
+
+        let mut outside = map_request(LOADABLE_REGION_SIZE, 1);
         assert_eq!(
-            map_mmap_err(MapError::InvalidHandle),
-            ErrorKind::InvalidInput
+            dev.ioctl_map_exec(&mut outside as *mut MapExecRequest as usize),
+            Err(ErrorKind::InvalidInput)
+        );
+
+        let mut bad_version = map_request(0, 4);
+        bad_version.version += 1;
+        assert_eq!(
+            dev.ioctl_map_exec(&mut bad_version as *mut MapExecRequest as usize),
+            Err(ErrorKind::InvalidInput)
+        );
+    }
+
+    #[test]
+    fn read_at_region_end_short_circuits_without_hardware() {
+        let dev = Esp32FlashDevice::new(ESP32_FLASH_DEVICE_NAME, region());
+        let mut buf = [0u8; 8];
+        assert_eq!(
+            dev.read(LOADABLE_REGION_SIZE as u64, &mut buf, false),
+            Ok(0)
         );
     }
 }

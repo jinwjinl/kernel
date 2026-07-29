@@ -23,7 +23,7 @@ use crate::{
         tmpfs::TmpFileSystem,
     },
 };
-use log::{debug, error, warn};
+use log::{debug, warn};
 
 mod dcache;
 mod devfs;
@@ -101,8 +101,10 @@ pub fn vfs_init() -> Result<(), Error> {
                 debug!("Mounted fatfs at '/{}'", BLOCK_STORAGE_MOUNT_POINT);
             }
             Err(error) => {
-                error!("Fail to init fat file system, {}", error);
-                return Err(error);
+                warn!(
+                    "No block device '{}', skip fatfs mount: {}",
+                    BLOCK_STORAGE_DEVICE_NAME, error
+                );
             }
         }
     }
