@@ -181,16 +181,25 @@ crate::define_peripheral! {
      blueos_driver::interrupt_controller::esp32_intc::Esp32Intc::new(0x600c_2000)),
     (spi2, Spi2Impl, Spi2Impl::new()),
     (flash_cs, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
-     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(5)),
+     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(3)),
 }
 
-crate::define_pin_states!(None);
+crate::define_pin_states!(
+    blueos_driver::pinctrl::esp32_pinctrl::Esp32IoMuxPinctrl,
+    (8, 1, false, false, false, 2, Some(63), None, false), // SCK  FSPICLK_OUT
+    (9, 1, true, false, false, 2, None, Some(64), false),  // MISO FSPIQ_IN
+    (10, 1, false, false, false, 2, Some(65), None, false), // MOSI FSPID_OUT
+    (3, 1, false, true, false, 2, None, None, true),       // CS   GPIO output, pull-up
+);
 
 #[cfg(enable_block)]
 crate::define_bus! {
-    (spi2_bus, crate::devices::spi_core::block_spi::BlockSpi<Spi2Impl, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>,
-        (flash, crate::drivers::flash::spi_flash::SpiFlashConfig,
-            crate::drivers::flash::spi_flash::SpiFlashConfig::new(BLOCK_STORAGE_DEVICE_NAME)),
+    (spi2_bus, crate::devices::spi_core::block_spi::BlockSpi<Spi2Impl>,
+        (flash, crate::drivers::flash::spi_flash::SpiFlashConfig<blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>,
+            crate::drivers::flash::spi_flash::SpiFlashConfig::new(
+                BLOCK_STORAGE_DEVICE_NAME,
+                get_device!(flash_cs),
+            )),
     )
 }
 
@@ -201,12 +210,8 @@ pub const BLOCK_STORAGE_POLICY: crate::boards::BlockStoragePolicy =
     crate::boards::BlockStoragePolicy::Optional;
 
 #[cfg(enable_block)]
-type FlashSpiBus = crate::devices::bus::Bus<
-    crate::devices::spi_core::block_spi::BlockSpi<
-        Spi2Impl,
-        blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
-    >,
->;
+type FlashSpiBus =
+    crate::devices::bus::Bus<crate::devices::spi_core::block_spi::BlockSpi<Spi2Impl>>;
 
 #[cfg(enable_block)]
 static FLASH_SPI_BUS: spin::Once<alloc::sync::Arc<FlashSpiBus>> = spin::Once::new();
@@ -214,28 +219,15 @@ static FLASH_SPI_BUS: spin::Once<alloc::sync::Arc<FlashSpiBus>> = spin::Once::ne
 #[cfg(enable_block)]
 fn init_flash_spi_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<FlashSpiBus>> {
     use crate::devices::{bus::Bus, spi_core::block_spi::BlockSpi};
-    use blueos_driver::{pinctrl::esp32_pinctrl::Esp32IoMuxPinctrl, spi::SpiConfig};
-    use blueos_hal::pinctrl::AlterFuncPin;
+    use blueos_driver::spi::SpiConfig;
 
     if let Some(spi_bus) = FLASH_SPI_BUS.get() {
         return Ok(spi_bus);
     }
 
-    // SPI2 pins: SCK=GPIO8, MISO=GPIO9, MOSI=GPIO10, CS=GPIO5.
-    const PIN_STATES: [Esp32IoMuxPinctrl; 4] = [
-        Esp32IoMuxPinctrl::new(8, 1, false, false, false, 2, Some(63), None, false), // SCK
-        Esp32IoMuxPinctrl::new(9, 1, true, false, false, 2, None, Some(64), false),  // MISO
-        Esp32IoMuxPinctrl::new(10, 1, false, false, false, 2, Some(65), None, false), // MOSI
-        Esp32IoMuxPinctrl::new(5, 1, false, true, false, 2, None, None, true),       // CS
-    ];
-    for pin in PIN_STATES {
-        pin.init();
-    }
-
     let spi2 = get_device!(spi2);
-    let cs = get_device!(flash_cs);
     let block_spi =
-        BlockSpi::new(spi2, cs, &SpiConfig::spi_flash_default()).map_err(|error| match error {
+        BlockSpi::new(spi2, &SpiConfig::spi_flash_default()).map_err(|error| match error {
             blueos_hal::err::HalError::Timeout => crate::error::code::ETIMEDOUT,
             _ => crate::error::code::EIO,
         })?;
@@ -251,7 +243,10 @@ pub(crate) fn init_block_devices() -> crate::drivers::Result<()> {
     for device in crate::boards::get_bus_devices!(spi2_bus) {
         spi2_bus.register_device(device)?;
     }
-    let driver = spi2_bus.probe_driver(&crate::drivers::flash::spi_flash::SpiFlashDriverModule)?;
+    let driver =
+        spi2_bus.probe_driver(&crate::drivers::flash::spi_flash::SpiFlashDriverModule::<
+            blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+        >::new())?;
     driver.init(spi2_bus)
 }
 
