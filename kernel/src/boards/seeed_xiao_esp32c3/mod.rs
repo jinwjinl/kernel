@@ -181,10 +181,16 @@ crate::define_peripheral! {
      blueos_driver::interrupt_controller::esp32_intc::Esp32Intc::new(0x600c_2000)),
     (spi2, Spi2Impl, Spi2Impl::new()),
     (flash_cs, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
-     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(5)),
+     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(3)),
 }
 
-crate::define_pin_states!(None);
+crate::define_pin_states!(
+    blueos_driver::pinctrl::esp32_pinctrl::Esp32IoMuxPinctrl,
+    (8, 1, false, false, false, 2, Some(63), None, false),  // SCK  FSPICLK_OUT
+    (9, 1, true,  false, false, 2, None, Some(64), false),  // MISO FSPIQ_IN
+    (10, 1, false, false, false, 2, Some(65), None, false), // MOSI FSPID_OUT
+    (3, 1, false, true,  false, 2, None, None, true),       // CS   GPIO output, pull-up
+);
 
 crate::define_bus! {
     (spi2_bus, crate::devices::spi_core::block_spi::BlockSpi<Spi2Impl, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>,
@@ -204,46 +210,52 @@ pub const IROM_VADDR_BASE: u32 = 0x4200_0000;
 pub const DROM_VADDR_BASE: u32 = 0x3C00_0000;
 pub const FLASH_MMU_PAGE_SIZE: u32 = 0x0001_0000; // 64 KB
 
-#[cfg(spi_core)]
-pub(crate) fn init_spi_bus() {
-    use crate::{
-        devices::{bus::Bus, spi_core::block_spi::BlockSpi},
-        drivers::InitDriver,
-    };
-    use alloc::sync::Arc;
-    use blueos_driver::{pinctrl::esp32_pinctrl::Esp32IoMuxPinctrl, spi::SpiConfig};
-    use blueos_hal::pinctrl::AlterFuncPin;
-    use spin::Once;
+pub const BLOCK_STORAGE_POLICY: crate::boards::BlockStoragePolicy =
+    crate::boards::BlockStoragePolicy::Optional;
 
-    // SPI2 pins: SCK=GPIO8, MISO=GPIO9, MOSI=GPIO10, CS=GPIO5.
-    const PIN_STATES: [Esp32IoMuxPinctrl; 4] = [
-        Esp32IoMuxPinctrl::new(8, 1, false, false, false, 2, Some(63), None, false), // SCK
-        Esp32IoMuxPinctrl::new(9, 1, true, false, false, 2, None, Some(64), false),  // MISO
-        Esp32IoMuxPinctrl::new(10, 1, false, false, false, 2, Some(65), None, false), // MOSI
-        Esp32IoMuxPinctrl::new(5, 1, false, true, false, 2, None, None, true),       // CS
-    ];
-    for pin in PIN_STATES {
-        pin.init();
+#[cfg(enable_block)]
+type FlashSpiBus = crate::devices::bus::Bus<
+    crate::devices::spi_core::block_spi::BlockSpi<
+        Spi2Impl,
+        blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+    >,
+>;
+
+#[cfg(enable_block)]
+static FLASH_SPI_BUS: spin::Once<alloc::sync::Arc<FlashSpiBus>> = spin::Once::new();
+
+#[cfg(enable_block)]
+fn init_flash_spi_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<FlashSpiBus>> {
+    use crate::devices::{bus::Bus, spi_core::block_spi::BlockSpi};
+    use blueos_driver::spi::SpiConfig;
+
+    if let Some(spi_bus) = FLASH_SPI_BUS.get() {
+        return Ok(spi_bus);
     }
 
-    static SPI2_BUS: Once<
-        Arc<Bus<BlockSpi<Spi2Impl, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>>>,
-    > = Once::new();
-
+    // SPI2 pin muxing is handled by define_pin_states! (initialized at boot
+    // via init_pin_states); here we only build the BlockSpi over spi2 + CS.
     let spi2 = get_device!(spi2);
     let cs = get_device!(flash_cs);
-    let block_spi = BlockSpi::new(spi2, cs, &SpiConfig::spi_flash_default())
-        .expect("Failed to configure SPI2 for flash");
-    SPI2_BUS.call_once(|| Arc::new(Bus::new(block_spi)));
-    let spi2_bus = SPI2_BUS.get().unwrap();
+    let block_spi =
+        BlockSpi::new(spi2, cs, &SpiConfig::spi_flash_default()).map_err(|error| match error {
+            blueos_hal::err::HalError::Timeout => crate::error::code::ETIMEDOUT,
+            _ => crate::error::code::EIO,
+        })?;
+    FLASH_SPI_BUS.call_once(|| alloc::sync::Arc::new(Bus::new(block_spi)));
+    FLASH_SPI_BUS.get().ok_or(crate::error::code::EIO)
+}
+
+#[cfg(enable_block)]
+pub(crate) fn init_block_devices() -> crate::drivers::Result<()> {
+    use crate::drivers::InitDriver;
+
+    let spi2_bus = init_flash_spi_bus()?;
     for device in crate::boards::get_bus_devices!(spi2_bus) {
-        spi2_bus.register_device(device).unwrap();
+        spi2_bus.register_device(device)?;
     }
-    if let Ok(d) = spi2_bus.probe_driver(&crate::drivers::flash::spi_flash::SpiFlashDriverModule) {
-        if let Err(e) = d.init(spi2_bus) {
-            log::warn!("Failed to init SPI flash: {}", e);
-        }
-    }
+    let driver = spi2_bus.probe_driver(&crate::drivers::flash::spi_flash::SpiFlashDriverModule)?;
+    driver.init(spi2_bus)
 }
 
 #[inline(always)]

@@ -45,7 +45,9 @@ pub(crate) fn init_internal_flash() -> Result<(), EspFlashError> {
 }
 
 /// Serializes complete multi-call transactions after scheduling starts; boot is single-threaded.
-static INTERNAL_FLASH_LOCK: Mutex = Mutex::new();
+crate::static_arc! {
+    INTERNAL_FLASH_LOCK(Mutex, Mutex::new()),
+}
 static INTERNAL_FLASH_CAPACITY: AtomicU32 = AtomicU32::new(0);
 
 struct InternalFlashGuard {

@@ -151,8 +151,14 @@ extern "C" fn init() {
         net::init();
         net::net_manager::init();
     }
-    #[cfg(spi_core)]
-    crate::boards::init_spi_bus();
+    #[cfg(enable_block)]
+    if let Err(error) = crate::boards::init_block_devices() {
+        if !crate::boards::BLOCK_STORAGE_POLICY.allows_missing()
+            || error != crate::error::code::ENODEV
+        {
+            panic!("Block storage initialization failed: {}", error);
+        }
+    }
     #[cfg(soc_esp32c3)]
     {
         if let Err(e) = crate::drivers::flash::init_internal_flash() {
