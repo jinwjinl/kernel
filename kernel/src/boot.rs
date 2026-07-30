@@ -138,8 +138,6 @@ extern "C" fn init() {
         // initialize virtio
         virtio::init_virtio(&fdt);
     }
-    #[cfg(enable_vfs)]
-    init_vfs();
 
     scheduler::init();
     logger::logger_init();
@@ -170,12 +168,6 @@ extern "C" fn init() {
     }
     #[cfg(enable_vfs)]
     init_vfs();
-    #[cfg(soc_esp32c3)]
-    {
-        if let Err(e) = crate::drivers::flash::init_internal_flash() {
-            log::warn!("Failed to init internal flash: {:?}", e);
-        }
-    }
     // it's an bug in fact, but at now we use a workaround let newlib do the c++ runtime initialization
     #[cfg(not(target_board = "newlib_mps3_an547"))]
     run_init_array();
