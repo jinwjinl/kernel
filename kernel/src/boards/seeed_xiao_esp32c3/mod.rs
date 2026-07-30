@@ -193,9 +193,12 @@ crate::define_pin_states!(
 );
 
 crate::define_bus! {
-    (spi2_bus, crate::devices::spi_core::block_spi::BlockSpi<Spi2Impl, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>,
-        (flash, crate::drivers::flash::spi_flash::SpiFlashConfig,
-            crate::drivers::flash::spi_flash::SpiFlashConfig::new(BLOCK_STORAGE_DEVICE_NAME)),
+    (spi2_bus, crate::devices::spi_core::block_spi::BlockSpi<Spi2Impl>,
+        (flash, crate::drivers::flash::spi_flash::SpiFlashConfig<blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>,
+            crate::drivers::flash::spi_flash::SpiFlashConfig::new(
+                BLOCK_STORAGE_DEVICE_NAME,
+                get_device!(flash_cs),
+            )),
     )
 }
 
@@ -214,12 +217,8 @@ pub const BLOCK_STORAGE_POLICY: crate::boards::BlockStoragePolicy =
     crate::boards::BlockStoragePolicy::Optional;
 
 #[cfg(enable_block)]
-type FlashSpiBus = crate::devices::bus::Bus<
-    crate::devices::spi_core::block_spi::BlockSpi<
-        Spi2Impl,
-        blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
-    >,
->;
+type FlashSpiBus =
+    crate::devices::bus::Bus<crate::devices::spi_core::block_spi::BlockSpi<Spi2Impl>>;
 
 #[cfg(enable_block)]
 static FLASH_SPI_BUS: spin::Once<alloc::sync::Arc<FlashSpiBus>> = spin::Once::new();
@@ -234,11 +233,11 @@ fn init_flash_spi_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<Flas
     }
 
     // SPI2 pin muxing is handled by define_pin_states! (initialized at boot
-    // via init_pin_states); here we only build the BlockSpi over spi2 + CS.
+    // via init_pin_states); here we only build the BlockSpi over spi2.
+    // CS is owned by SpiFlashConfig and driven via SpinLockDevice at probe time.
     let spi2 = get_device!(spi2);
-    let cs = get_device!(flash_cs);
     let block_spi =
-        BlockSpi::new(spi2, cs, &SpiConfig::spi_flash_default()).map_err(|error| match error {
+        BlockSpi::new(spi2, &SpiConfig::spi_flash_default()).map_err(|error| match error {
             blueos_hal::err::HalError::Timeout => crate::error::code::ETIMEDOUT,
             _ => crate::error::code::EIO,
         })?;
@@ -254,7 +253,10 @@ pub(crate) fn init_block_devices() -> crate::drivers::Result<()> {
     for device in crate::boards::get_bus_devices!(spi2_bus) {
         spi2_bus.register_device(device)?;
     }
-    let driver = spi2_bus.probe_driver(&crate::drivers::flash::spi_flash::SpiFlashDriverModule)?;
+    let driver =
+        spi2_bus.probe_driver(&crate::drivers::flash::spi_flash::SpiFlashDriverModule::<
+            blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+        >::new())?;
     driver.init(spi2_bus)
 }
 
