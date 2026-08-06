@@ -186,10 +186,10 @@ crate::define_peripheral! {
 
 crate::define_pin_states!(
     blueos_driver::pinctrl::esp32_pinctrl::Esp32IoMuxPinctrl,
-    (8, 1, false, false, false, 2, Some(63), None, false),  // SCK  FSPICLK_OUT
-    (9, 1, true,  false, false, 2, None, Some(64), false),  // MISO FSPIQ_IN
+    (8, 1, false, false, false, 2, Some(63), None, false), // SCK  FSPICLK_OUT
+    (9, 1, true, false, false, 2, None, Some(64), false),  // MISO FSPIQ_IN
     (10, 1, false, false, false, 2, Some(65), None, false), // MOSI FSPID_OUT
-    (3, 1, false, true,  false, 2, None, None, true),       // CS   GPIO output, pull-up
+    (3, 1, false, true, false, 2, None, None, true),       // CS   GPIO output, pull-up
 );
 
 crate::define_bus! {
@@ -206,8 +206,10 @@ pub const BLOCK_STORAGE_DEVICE_NAME: &str = "flash-storage";
 pub const BLOCK_STORAGE_MOUNT_POINT: &str = "data";
 
 // ESP32-C3 on-chip flash + MMU layout (single source of truth for kernel drivers).
-pub const LOADABLE_REGION_BASE: u32 = 0x0011_0000;
-pub const LOADABLE_REGION_SIZE: u32 = 0x002F_0000;
+// The factory app occupies [0x10000, 0x200000). Reserve the following 1 MiB
+// for XIP-loaded images; [0x300000, 0x400000) remains unassigned.
+pub const LOADABLE_REGION_BASE: u32 = 0x0020_0000;
+pub const LOADABLE_REGION_SIZE: u32 = 0x0010_0000;
 pub const LOADABLE_REGION_END: u32 = LOADABLE_REGION_BASE + LOADABLE_REGION_SIZE;
 pub const IROM_VADDR_BASE: u32 = 0x4200_0000;
 pub const DROM_VADDR_BASE: u32 = 0x3C00_0000;

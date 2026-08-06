@@ -406,6 +406,13 @@ mod tests {
         InternalFlashRegion::new(LOADABLE_REGION_BASE, LOADABLE_REGION_SIZE)
     }
 
+    #[test]
+    fn loadable_region_reserves_one_mib() {
+        assert_eq!(LOADABLE_REGION_BASE, 0x0020_0000);
+        assert_eq!(LOADABLE_REGION_SIZE, 0x0010_0000);
+        assert_eq!(LOADABLE_REGION_END, 0x0030_0000);
+    }
+
     fn map_request(region_offset: u32, image_size: u32) -> MapExecRequest {
         MapExecRequest {
             version: FLASH_IOCTL_ABI_VERSION,
@@ -422,7 +429,7 @@ mod tests {
         assert_eq!(region().absolute_offset(0, 0), Ok(LOADABLE_REGION_BASE));
         assert_eq!(
             region().absolute_offset(0x000F_0000, 0x1CFC),
-            Ok(0x0020_0000)
+            Ok(LOADABLE_REGION_BASE + 0x000F_0000)
         );
     }
 

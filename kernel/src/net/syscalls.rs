@@ -453,6 +453,9 @@ pub fn setsockopt(
 
     // option_name suppose to contain only one option
     if level == libc::SOL_SOCKET {
+        if (option_name & libc::SO_REUSEADDR) != 0 {
+            return 0;
+        }
         if (option_name & libc::SO_RCVTIMEO) != 0 {
             return match unsafe { Timeval::from_ptr(option_value, option_len) } {
                 Some(timeval) => {
