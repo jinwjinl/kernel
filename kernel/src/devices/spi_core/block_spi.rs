@@ -254,10 +254,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{devices::bus::Bus, sync::SpinLock};
+    #[cfg(use_embedded_hal_v1)]
+    use crate::devices::bus::Bus;
+    use crate::sync::SpinLock;
     use alloc::{boxed::Box, vec::Vec};
     use blueos_hal::{Configuration, PlatPeri};
     use blueos_test_macro::test;
+    #[cfg(use_embedded_hal_v1)]
     use embedded_hal::digital::ErrorType as DigitalErrorType;
 
     struct MockSpi {
@@ -301,15 +304,18 @@ mod tests {
             Ok(())
         }
     }
+    #[cfg(use_embedded_hal_v1)]
     struct LockCheckingCs {
         bus: BusWrapper<BlockSpi<MockSpi>>,
         observations: Vec<bool>,
     }
 
+    #[cfg(use_embedded_hal_v1)]
     impl DigitalErrorType for LockCheckingCs {
         type Error = core::convert::Infallible;
     }
 
+    #[cfg(use_embedded_hal_v1)]
     impl OutputPin for LockCheckingCs {
         fn set_low(&mut self) -> Result<(), Self::Error> {
             self.observations.push(self.bus.1.count() != 0);
@@ -322,8 +328,10 @@ mod tests {
         }
     }
 
+    #[cfg(use_embedded_hal_v1)]
     struct NoopDelay;
 
+    #[cfg(use_embedded_hal_v1)]
     impl DelayNs for NoopDelay {
         fn delay_ns(&mut self, _ns: u32) {}
     }
@@ -346,6 +354,7 @@ mod tests {
         }
     }
 
+    #[cfg(use_embedded_hal_v1)]
     #[test]
     fn test_device_holds_bus_lock_for_entire_transaction() {
         let mock = Box::leak(Box::new(MockSpi::new()));
