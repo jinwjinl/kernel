@@ -31,10 +31,8 @@ pub mod flash_mmap;
 #[cfg(soc_esp32c3)]
 pub(crate) mod esp32_flash;
 
-// Re-export so boot.rs can call `crate::drivers::flash::init_internal_flash()`
-// without naming the submodule path.
-#[cfg(soc_esp32c3)]
-pub(crate) use internal_flash::init_internal_flash;
-
 #[cfg(soc_esp32c3)]
 pub(crate) use esp32_flash::init_esp32_flash_device;
+
+#[cfg(soc_esp32c3)]
+pub(crate) use internal_flash::init_internal_flash;

@@ -25,7 +25,7 @@ use crate::{
     devices::{
         block::{Block, BlockDriverOps, BlockError, ErrorType},
         bus::{Bus, BusInterface},
-        spi_core::block_spi::{BlockSpi, HalOutputPinAdapter, SpinLockDevice},
+        spi_core::{block_spi::BlockSpi, ExclusiveSpiWithCs},
         DeviceData, DeviceManager,
     },
     drivers::{
@@ -35,22 +35,36 @@ use crate::{
     sync::SpinLock,
 };
 
-const FLASH_SECTOR_SIZE: u16 = 512;
-const FLASH_ERASE_SIZE: usize = 4096;
-const PAGES_PER_ERASE_BLOCK: usize = FLASH_ERASE_SIZE / 256;
-const MAX_24BIT_CAPACITY: u64 = 0x0100_0000;
-const ERASE_CACHE_SLOTS: usize = 2;
+const FLASH_SECTOR_SIZE: u16 = blueos_kconfig::CONFIG_SPI_FLASH_SECTOR_SIZE as u16;
+const FLASH_PAGE_SIZE: usize = blueos_kconfig::CONFIG_SPI_FLASH_PAGE_SIZE as usize;
+const FLASH_ERASE_SIZE: usize = blueos_kconfig::CONFIG_SPI_FLASH_ERASE_SIZE as usize;
+const PAGES_PER_ERASE_BLOCK: usize = FLASH_ERASE_SIZE / FLASH_PAGE_SIZE;
+const MAX_24BIT_CAPACITY: u64 = blueos_kconfig::CONFIG_SPI_FLASH_MAX_CAPACITY as u64;
+const ERASE_CACHE_SLOTS: usize = blueos_kconfig::CONFIG_SPI_FLASH_ERASE_CACHE_SLOTS as usize;
+const SECTOR_ERASE_SIZE: usize = 4096;
+const BLOCK_ERASE_32K_SIZE: usize = 32768;
+const BLOCK_ERASE_64K_SIZE: usize = 65536;
+
+const _: () = {
+    assert!(FLASH_ERASE_SIZE % FLASH_PAGE_SIZE == 0);
+    assert!(FLASH_ERASE_SIZE % FLASH_SECTOR_SIZE as usize == 0);
+    assert!(matches!(
+        FLASH_ERASE_SIZE,
+        SECTOR_ERASE_SIZE | BLOCK_ERASE_32K_SIZE | BLOCK_ERASE_64K_SIZE
+    ));
+    assert!(MAX_24BIT_CAPACITY >= FLASH_ERASE_SIZE as u64);
+};
 
 fn capacity_from_jedec_id(jedec_id: u32) -> Result<u64, FlashError> {
     let density = (jedec_id & 0xFF) as u32;
     let capacity = 1u64.checked_shl(density).ok_or(FlashError::NotReady)?;
-    if capacity < FLASH_SECTOR_SIZE as u64 {
+    if capacity < FLASH_ERASE_SIZE as u64 || capacity % FLASH_ERASE_SIZE as u64 != 0 {
         return Err(FlashError::NotReady);
     }
     if capacity > MAX_24BIT_CAPACITY {
-        return Err(FlashError::AddrOverflow {
-            addr: MAX_24BIT_CAPACITY as u32,
-        });
+        return Err(FlashError::InvalidParam(
+            "capacity exceeds configured maximum",
+        ));
     }
     Ok(capacity)
 }
@@ -80,11 +94,7 @@ impl EraseCacheSlot {
     }
 }
 
-/// SPI NOR Flash FTL block driver with a two-entry erase-block write-back cache.
-///
-/// FAT updates alternate between the FAT metadata erase block and the current
-/// file-data erase block. Keeping both resident avoids erasing and rewriting the
-/// FAT block for every newly allocated cluster.
+/// SPI NOR Flash block driver with two write-back cache slots.
 pub struct SpiFlashBlockDriver<SPI: SpiDevice<u8>> {
     flash_cmd: SpiFlashCmd<SPI>,
     capacity_bytes: u64,
@@ -97,7 +107,7 @@ impl<SPI: SpiDevice<u8> + Send> SpiFlashBlockDriver<SPI> {
         SpiFlashBlockDriver {
             flash_cmd,
             capacity_bytes,
-            cache: [EraseCacheSlot::new(), EraseCacheSlot::new()],
+            cache: core::array::from_fn(|_| EraseCacheSlot::new()),
             use_counter: 0,
         }
     }
@@ -133,11 +143,16 @@ impl<SPI: SpiDevice<u8> + Send> SpiFlashBlockDriver<SPI> {
             .ok_or(FlashError::NotReady)?;
         let addr = (erase_block_id * FLASH_ERASE_SIZE) as u32;
 
-        self.flash_cmd.sector_erase(addr)?;
+        match FLASH_ERASE_SIZE {
+            SECTOR_ERASE_SIZE => self.flash_cmd.sector_erase(addr)?,
+            BLOCK_ERASE_32K_SIZE => self.flash_cmd.block_erase_32k(addr)?,
+            BLOCK_ERASE_64K_SIZE => self.flash_cmd.block_erase_64k(addr)?,
+            _ => return Err(FlashError::InvalidParam("unsupported erase size")),
+        }
 
         for page_idx in 0..PAGES_PER_ERASE_BLOCK {
-            let page_offset = page_idx * 256;
-            let page_data = &self.cache[slot].data[page_offset..page_offset + 256];
+            let page_offset = page_idx * FLASH_PAGE_SIZE;
+            let page_data = &self.cache[slot].data[page_offset..page_offset + FLASH_PAGE_SIZE];
             self.flash_cmd
                 .page_program(addr + page_offset as u32, page_data)?;
         }
@@ -153,18 +168,20 @@ impl<SPI: SpiDevice<u8> + Send> SpiFlashBlockDriver<SPI> {
             return Ok(slot);
         }
 
-        let slot = self
+        let slot = if let Some(slot) = self
             .cache
             .iter()
             .position(|entry| entry.erase_block_id.is_none())
-            .unwrap_or_else(|| {
-                self.cache
-                    .iter()
-                    .enumerate()
-                    .min_by_key(|(_, entry)| entry.last_used)
-                    .map(|(index, _)| index)
-                    .unwrap()
-            });
+        {
+            slot
+        } else {
+            self.cache
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, entry)| entry.last_used)
+                .map(|(index, _)| index)
+                .ok_or(FlashError::NotReady)?
+        };
 
         self.flush_slot(slot)?;
         self.load_slot(slot, erase_block_id)?;
@@ -191,7 +208,7 @@ impl<SPI: SpiDevice<u8> + Send + Sync> BlockDriverOps for SpiFlashBlockDriver<SP
     }
 
     fn read_blocks(&mut self, block_id: usize, buf: &mut [u8]) -> Result<(), Self::Error> {
-        // A request may span several erase blocks; process one cache-sized chunk at a time.
+        // Process requests across erase-block boundaries.
         let mut cur_block = block_id;
         let mut buf_off = 0usize;
         while buf_off < buf.len() {
@@ -217,7 +234,7 @@ impl<SPI: SpiDevice<u8> + Send + Sync> BlockDriverOps for SpiFlashBlockDriver<SP
     }
 
     fn write_blocks(&mut self, block_id: usize, buf: &[u8]) -> Result<(), Self::Error> {
-        // A request may span several erase blocks; process one cache-sized chunk at a time.
+        // Process requests across erase-block boundaries.
         let mut cur_block = block_id;
         let mut buf_off = 0usize;
         while buf_off < buf.len() {
@@ -270,7 +287,7 @@ where
     let block = Block::<BlockError<FlashBlockError>, { FLASH_SECTOR_SIZE as usize }>::new(
         name,
         Arc::new(SpinLock::new(block_driver)),
-    );
+    )?;
 
     DeviceManager::get()
         .register_device(String::from(name), Arc::new(block))
@@ -278,10 +295,6 @@ where
 
     Ok(())
 }
-
-// SPI must be Send + Sync: the driver is shared via SpinLock behind an Arc<dyn
-// Device>, so it crosses threads (Send) and is referenced from &self (Sync).
-unsafe impl<SPI: SpiDevice<u8> + Send + Sync> Sync for SpiFlashBlockDriver<SPI> {}
 
 pub struct SpiFlashConfig<G: OutputPin> {
     pub name: &'static str,
@@ -295,17 +308,15 @@ impl<G: OutputPin> SpiFlashConfig<G> {
 }
 
 #[cfg(use_embedded_hal_v1)]
-impl<T, G> InitDriver<BlockSpi<T>> for SpiFlashConfig<G>
+impl<T, G> InitDriver<BlockSpi<T, G>> for SpiFlashConfig<G>
 where
     T: PlatPeri + Spi<SpiConfig, ()>,
     G: PlatPeri + OutputPin,
 {
     type Data = ();
 
-    fn init(self, bus: &Bus<BlockSpi<T>>) -> crate::drivers::Result<Self::Data> {
-        let flash_cs = HalOutputPinAdapter::new(self.cs);
-        let spi_device = SpinLockDevice::new(bus.intf.clone(), flash_cs, crate::sync::KernelDelay)
-            .map_err(|_| crate::error::code::EIO)?;
+    fn init(self, bus: &Bus<BlockSpi<T, G>>) -> crate::drivers::Result<Self::Data> {
+        let spi_device = ExclusiveSpiWithCs::new(bus.intf.clone(), self.cs);
         let mut flash_cmd = SpiFlashCmd::new(spi_device);
 
         let jedec_id = flash_cmd.jedec_id().map_err(|error| match error {
@@ -329,7 +340,8 @@ where
         let block = Block::<BlockError<FlashBlockError>, { FLASH_SECTOR_SIZE as usize }>::new(
             self.name,
             Arc::new(SpinLock::new(block_driver)),
-        );
+        )
+        .map_err(|_| crate::error::code::EOVERFLOW)?;
 
         DeviceManager::get()
             .register_device(String::from(self.name), Arc::new(block))
@@ -352,7 +364,7 @@ impl<G> SpiFlashDriverModule<G> {
 }
 
 #[cfg(use_embedded_hal_v1)]
-impl<T, G> DriverModule<BlockSpi<T>> for SpiFlashDriverModule<G>
+impl<T, G> DriverModule<BlockSpi<T, G>> for SpiFlashDriverModule<G>
 where
     T: PlatPeri + Spi<SpiConfig, ()>,
     G: PlatPeri + OutputPin,
@@ -388,12 +400,17 @@ mod tests {
     use core::cell::UnsafeCell;
     use embedded_hal::spi::{ErrorKind, Operation, SpiDevice};
 
+    const TEST_SECTOR_SIZE: usize = FLASH_SECTOR_SIZE as usize;
+    const BLOCKS_PER_ERASE: usize = FLASH_ERASE_SIZE / TEST_SECTOR_SIZE;
+
     #[test]
     fn test_capacity_from_jedec_id_rejects_unsupported_density() {
         assert_eq!(capacity_from_jedec_id(0xEF4008), Err(FlashError::NotReady));
         assert_eq!(
             capacity_from_jedec_id(0xEF4019),
-            Err(FlashError::AddrOverflow { addr: 0x0100_0000 })
+            Err(FlashError::InvalidParam(
+                "capacity exceeds configured maximum"
+            ))
         );
     }
 
@@ -518,17 +535,17 @@ mod tests {
     #[test]
     fn test_block_driver_capacity() {
         let (driver, _shared) = create_block_driver(1024 * 1024);
-        assert_eq!(driver.capacity(), 1024 * 1024 / 512);
-        assert_eq!(driver.sector_size(), 512);
+        assert_eq!(driver.capacity(), 1024 * 1024 / FLASH_SECTOR_SIZE as u64);
+        assert_eq!(driver.sector_size(), FLASH_SECTOR_SIZE);
     }
 
     #[test]
     fn test_read_blocks_from_flash() {
         let (mut driver, shared) = create_block_driver(1024 * 1024);
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; TEST_SECTOR_SIZE];
 
         with_shared(&shared, |s| {
-            s.read_queue.push(alloc::vec![0xAA; 512]);
+            s.read_queue.push(alloc::vec![0xAA; TEST_SECTOR_SIZE]);
         });
 
         driver.read_blocks(0, &mut buf).unwrap();
@@ -542,14 +559,14 @@ mod tests {
     #[test]
     fn test_read_blocks_from_dirty_cache() {
         let (mut driver, shared) = create_block_driver(1024 * 1024);
-        let mut write_buf = [0xBB; 512];
+        let mut write_buf = [0xBB; TEST_SECTOR_SIZE];
 
         with_shared(&shared, |s| {
             s.read_queue.push(alloc::vec![0u8; FLASH_ERASE_SIZE]);
         });
         driver.write_blocks(0, &write_buf).unwrap();
 
-        let mut read_buf = [0u8; 512];
+        let mut read_buf = [0u8; TEST_SECTOR_SIZE];
         with_shared(&shared, |s| {
             s.writes.clear();
             s.transaction_count = 0;
@@ -565,7 +582,7 @@ mod tests {
     #[test]
     fn test_write_marks_dirty() {
         let (mut driver, shared) = create_block_driver(1024 * 1024);
-        let write_data = [0xCC; 512];
+        let write_data = [0xCC; TEST_SECTOR_SIZE];
 
         with_shared(&shared, |s| {
             s.read_queue.push(alloc::vec![0u8; FLASH_ERASE_SIZE]);
@@ -580,7 +597,7 @@ mod tests {
     #[test]
     fn test_flush_erase_block() {
         let (mut driver, shared) = create_block_driver(1024 * 1024);
-        let write_data = [0xDD; 512];
+        let write_data = [0xDD; TEST_SECTOR_SIZE];
 
         with_shared(&shared, |s| {
             s.read_queue.push(alloc::vec![0u8; FLASH_ERASE_SIZE]);
@@ -593,8 +610,16 @@ mod tests {
         });
 
         driver.write_blocks(0, &write_data).unwrap();
+        with_shared(&shared, |s| s.writes.clear());
         driver.flush().unwrap();
 
+        let erase_opcode = match FLASH_ERASE_SIZE {
+            SECTOR_ERASE_SIZE => 0x20,
+            BLOCK_ERASE_32K_SIZE => 0x52,
+            BLOCK_ERASE_64K_SIZE => 0xD8,
+            _ => unreachable!(),
+        };
+        with_shared(&shared, |s| assert_eq!(s.writes[2], erase_opcode));
         assert!(driver.cache.iter().all(|slot| !slot.dirty));
     }
 
@@ -607,8 +632,10 @@ mod tests {
             s.read_queue.push(alloc::vec![0xFF; FLASH_ERASE_SIZE]);
         });
 
-        driver.write_blocks(0, &[0xAA; 512]).unwrap();
-        driver.write_blocks(8, &[0xBB; 512]).unwrap();
+        driver.write_blocks(0, &[0xAA; TEST_SECTOR_SIZE]).unwrap();
+        driver
+            .write_blocks(BLOCKS_PER_ERASE, &[0xBB; TEST_SECTOR_SIZE])
+            .unwrap();
 
         assert!(driver.cached_slot(0).is_some());
         assert!(driver.cached_slot(1).is_some());
@@ -624,13 +651,11 @@ mod tests {
             s.read_queue.push(alloc::vec![0u8; FLASH_ERASE_SIZE]);
         });
 
-        // Block 0 models the FAT metadata erase block and block 1 models the
-        // current file-data erase block. Returning to block 0 must be a cache
-        // hit; neither dirty block may be flushed merely because access
-        // alternates between the two.
-        driver.write_blocks(0, &[0x11; 512]).unwrap();
-        driver.write_blocks(8, &[0x22; 512]).unwrap();
-        driver.write_blocks(1, &[0x33; 512]).unwrap();
+        driver.write_blocks(0, &[0x11; TEST_SECTOR_SIZE]).unwrap();
+        driver
+            .write_blocks(BLOCKS_PER_ERASE, &[0x22; TEST_SECTOR_SIZE])
+            .unwrap();
+        driver.write_blocks(0, &[0x33; TEST_SECTOR_SIZE]).unwrap();
 
         with_shared(&shared, |s| {
             assert_eq!(s.read_queue.len(), 0);
@@ -645,9 +670,15 @@ mod tests {
     fn test_block_offset_in_erase() {
         let (driver, _shared) = create_block_driver(1024 * 1024);
         assert_eq!(driver.block_offset_in_erase(0), 0);
-        assert_eq!(driver.block_offset_in_erase(7), 3584);
-        assert_eq!(driver.block_offset_in_erase(8), 0);
-        assert_eq!(driver.block_offset_in_erase(9), 512);
+        assert_eq!(
+            driver.block_offset_in_erase(BLOCKS_PER_ERASE - 1),
+            FLASH_ERASE_SIZE - TEST_SECTOR_SIZE
+        );
+        assert_eq!(driver.block_offset_in_erase(BLOCKS_PER_ERASE), 0);
+        assert_eq!(
+            driver.block_offset_in_erase(BLOCKS_PER_ERASE + 1),
+            TEST_SECTOR_SIZE
+        );
     }
 
     #[test]
@@ -663,7 +694,7 @@ mod tests {
     #[test]
     fn test_spi_error_on_read() {
         let (mut driver, shared) = create_block_driver(1024 * 1024);
-        let mut buf = [0u8; 512];
+        let mut buf = [0u8; TEST_SECTOR_SIZE];
 
         with_shared(&shared, |s| {
             s.should_fail = true;

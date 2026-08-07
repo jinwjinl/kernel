@@ -181,7 +181,10 @@ crate::define_peripheral! {
      blueos_driver::interrupt_controller::esp32_intc::Esp32Intc::new(0x600c_2000)),
     (spi2, Spi2Impl, Spi2Impl::new()),
     (flash_cs, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
-     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(3)),
+     unsafe {
+         // SAFETY: GPIO 3 is less than 26.
+         blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new_unchecked(3)
+     }),
 }
 
 crate::define_pin_states!(
@@ -192,9 +195,18 @@ crate::define_pin_states!(
     (3, 1, false, true, false, 2, None, None, true),       // CS   GPIO output, pull-up
 );
 
+#[cfg(enable_block)]
+type FlashConfig = crate::drivers::flash::spi_flash::SpiFlashConfig<
+    blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+>;
+
+#[cfg(enable_block)]
 crate::define_bus! {
-    (spi2_bus, crate::devices::spi_core::block_spi::BlockSpi<Spi2Impl>,
-        (flash, crate::drivers::flash::spi_flash::SpiFlashConfig<blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>,
+    (spi2_bus, crate::devices::spi_core::block_spi::BlockSpi<
+        Spi2Impl,
+        blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin
+    >,
+        (flash, FlashConfig,
             crate::drivers::flash::spi_flash::SpiFlashConfig::new(
                 BLOCK_STORAGE_DEVICE_NAME,
                 get_device!(flash_cs),
@@ -205,22 +217,24 @@ crate::define_bus! {
 pub const BLOCK_STORAGE_DEVICE_NAME: &str = "flash-storage";
 pub const BLOCK_STORAGE_MOUNT_POINT: &str = "data";
 
-// ESP32-C3 on-chip flash + MMU layout (single source of truth for kernel drivers).
-// The factory app occupies [0x10000, 0x200000). Reserve the following 1 MiB
-// for XIP-loaded images; [0x300000, 0x400000) remains unassigned.
+// ESP32-C3 on-chip flash and MMU layout.
 pub const LOADABLE_REGION_BASE: u32 = 0x0020_0000;
 pub const LOADABLE_REGION_SIZE: u32 = 0x0010_0000;
 pub const LOADABLE_REGION_END: u32 = LOADABLE_REGION_BASE + LOADABLE_REGION_SIZE;
 pub const IROM_VADDR_BASE: u32 = 0x4200_0000;
 pub const DROM_VADDR_BASE: u32 = 0x3C00_0000;
-pub const FLASH_MMU_PAGE_SIZE: u32 = 0x0001_0000; // 64 KB
+pub const FLASH_MMU_PAGE_SIZE: u32 = 0x0001_0000;
 
 pub const BLOCK_STORAGE_POLICY: crate::boards::BlockStoragePolicy =
     crate::boards::BlockStoragePolicy::Optional;
 
 #[cfg(enable_block)]
-type FlashSpiBus =
-    crate::devices::bus::Bus<crate::devices::spi_core::block_spi::BlockSpi<Spi2Impl>>;
+type FlashSpiBus = crate::devices::bus::Bus<
+    crate::devices::spi_core::block_spi::BlockSpi<
+        Spi2Impl,
+        blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+    >,
+>;
 
 #[cfg(enable_block)]
 static FLASH_SPI_BUS: spin::Once<alloc::sync::Arc<FlashSpiBus>> = spin::Once::new();
@@ -234,12 +248,9 @@ fn init_flash_spi_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<Flas
         return Ok(spi_bus);
     }
 
-    // SPI2 pin muxing is handled by define_pin_states! (initialized at boot
-    // via init_pin_states); here we only build the BlockSpi over spi2.
-    // CS is owned by SpiFlashConfig and driven via SpinLockDevice at probe time.
     let spi2 = get_device!(spi2);
-    let block_spi =
-        BlockSpi::new(spi2, &SpiConfig::spi_flash_default()).map_err(|error| match error {
+    let block_spi = BlockSpi::new(spi2, get_device!(flash_cs), &SpiConfig::spi_flash_default())
+        .map_err(|error| match error {
             blueos_hal::err::HalError::Timeout => crate::error::code::ETIMEDOUT,
             _ => crate::error::code::EIO,
         })?;
