@@ -52,11 +52,9 @@ MEMORY
     */    
 
     /* Instruction ROM */
-    /* Keep 0x42200000..0x42300000 available for the XIP loader mapping. */
-    IROM : ORIGIN =   0x42000000 + 0x20, LENGTH = 0x200000 - 0x20
+    IROM : ORIGIN =   0x42000000 + 0x20, LENGTH = 0x400000 - 0x20
     /* Data ROM */
-    /* The C3 shares the corresponding IROM/DROM MMU table entries. */
-    DROM (rxai!w) : ORIGIN = 0x3C000000 + 0x20, LENGTH = 0x200000 - 0x20
+    DROM (rxai!w) : ORIGIN = 0x3C000000 + 0x20, LENGTH = 0x400000 - 0x20
 
     /* RTC fast memory (executable). Persists over deep sleep. */
     RTC_FAST : ORIGIN = 0x50000000, LENGTH = 0x2000 /*- ESP_BOOTLOADER_RESERVE_RTC*/    
