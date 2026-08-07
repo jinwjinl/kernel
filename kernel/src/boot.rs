@@ -138,17 +138,6 @@ extern "C" fn init() {
         // initialize virtio
         virtio::init_virtio(&fdt);
     }
-
-    scheduler::init();
-    logger::logger_init();
-    time::timer::init();
-    #[cfg(kernel_async)]
-    asynk::init();
-    #[cfg(enable_net)]
-    {
-        net::init();
-        net::net_manager::init();
-    }
     #[cfg(enable_block)]
     if let Err(error) = crate::boards::init_block_devices() {
         if !crate::boards::BLOCK_STORAGE_POLICY.allows_missing()
@@ -157,17 +146,28 @@ extern "C" fn init() {
             panic!("Block storage initialization failed: {}", error);
         }
     }
-    #[cfg(soc_esp32c3)]
-    {
-        if let Err(e) = crate::drivers::flash::init_internal_flash() {
-            log::warn!("Failed to init internal flash: {:?}", e);
-        }
-        if let Err(e) = crate::drivers::flash::init_esp32_flash_device() {
-            log::warn!("Failed to init esp32-flash0: {:?}", e);
-        }
-    }
     #[cfg(enable_vfs)]
     init_vfs();
+
+    scheduler::init();
+    logger::logger_init();
+    time::timer::init();
+    #[cfg(soc_esp32c3)]
+    {
+        if let Err(error) = crate::drivers::flash::init_internal_flash() {
+            log::warn!("Failed to init internal flash: {:?}", error);
+        }
+        if let Err(error) = crate::drivers::flash::init_esp32_flash_device() {
+            log::warn!("Failed to init esp32-flash0: {:?}", error);
+        }
+    }
+    #[cfg(kernel_async)]
+    asynk::init();
+    #[cfg(enable_net)]
+    {
+        net::init();
+        net::net_manager::init();
+    }
     // it's an bug in fact, but at now we use a workaround let newlib do the c++ runtime initialization
     #[cfg(not(target_board = "newlib_mps3_an547"))]
     run_init_array();

@@ -181,20 +181,29 @@ crate::define_peripheral! {
      blueos_driver::interrupt_controller::esp32_intc::Esp32Intc::new(0x600c_2000)),
     (spi2, Spi2Impl, Spi2Impl::new()),
     (flash_cs, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
-     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(3)),
+     unsafe {
+         // SAFETY: GPIO 3 is less than 26.
+         blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new_unchecked(3)
+     }),
 }
 
 crate::define_pin_states!(
     blueos_driver::pinctrl::esp32_pinctrl::Esp32IoMuxPinctrl,
-    (8, 1, false, false, false, 2, Some(63), None, false),  // SCK  FSPICLK_OUT
-    (9, 1, true,  false, false, 2, None, Some(64), false),  // MISO FSPIQ_IN
+    (8, 1, false, false, false, 2, Some(63), None, false), // SCK  FSPICLK_OUT
+    (9, 1, true, false, false, 2, None, Some(64), false),  // MISO FSPIQ_IN
     (10, 1, false, false, false, 2, Some(65), None, false), // MOSI FSPID_OUT
-    (3, 1, false, true,  false, 2, None, None, true),       // CS   GPIO output, pull-up
+    (3, 1, false, true, false, 2, None, None, true),       // CS   GPIO output, pull-up
 );
 
+#[cfg(enable_block)]
+type FlashConfig = crate::drivers::flash::spi_flash::SpiFlashConfig<
+    blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+>;
+
+#[cfg(enable_block)]
 crate::define_bus! {
     (spi2_bus, crate::devices::spi_core::block_spi::BlockSpi<Spi2Impl>,
-        (flash, crate::drivers::flash::spi_flash::SpiFlashConfig<blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>,
+        (flash, FlashConfig,
             crate::drivers::flash::spi_flash::SpiFlashConfig::new(
                 BLOCK_STORAGE_DEVICE_NAME,
                 get_device!(flash_cs),
@@ -205,13 +214,13 @@ crate::define_bus! {
 pub const BLOCK_STORAGE_DEVICE_NAME: &str = "flash-storage";
 pub const BLOCK_STORAGE_MOUNT_POINT: &str = "data";
 
-// ESP32-C3 on-chip flash + MMU layout (single source of truth for kernel drivers).
-pub const LOADABLE_REGION_BASE: u32 = 0x0011_0000;
-pub const LOADABLE_REGION_SIZE: u32 = 0x002F_0000;
+// ESP32-C3 on-chip flash and MMU layout.
+pub const LOADABLE_REGION_BASE: u32 = 0x0020_0000;
+pub const LOADABLE_REGION_SIZE: u32 = 0x0010_0000;
 pub const LOADABLE_REGION_END: u32 = LOADABLE_REGION_BASE + LOADABLE_REGION_SIZE;
 pub const IROM_VADDR_BASE: u32 = 0x4200_0000;
 pub const DROM_VADDR_BASE: u32 = 0x3C00_0000;
-pub const FLASH_MMU_PAGE_SIZE: u32 = 0x0001_0000; // 64 KB
+pub const FLASH_MMU_PAGE_SIZE: u32 = 0x0001_0000;
 
 pub const BLOCK_STORAGE_POLICY: crate::boards::BlockStoragePolicy =
     crate::boards::BlockStoragePolicy::Optional;
@@ -232,9 +241,6 @@ fn init_flash_spi_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<Flas
         return Ok(spi_bus);
     }
 
-    // SPI2 pin muxing is handled by define_pin_states! (initialized at boot
-    // via init_pin_states); here we only build the BlockSpi over spi2.
-    // CS is owned by SpiFlashConfig and driven via SpinLockDevice at probe time.
     let spi2 = get_device!(spi2);
     let block_spi =
         BlockSpi::new(spi2, &SpiConfig::spi_flash_default()).map_err(|error| match error {
