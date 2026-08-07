@@ -22,6 +22,8 @@ use embedded_hal::{
 };
 use embedded_hal_bus::spi::DeviceError;
 
+const TRANSFER_CHUNK_SIZE: usize = 64;
+
 pub struct BlockSpi<T: PlatPeri> {
     inner: &'static T,
 }
@@ -47,10 +49,14 @@ impl<T: blueos_hal::spi::Spi<SpiConfig, ()>> BlockSpi<T> {
     }
 
     fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), crate::error::Error> {
-        self.inner
-            .write(words)
-            .map_err(|_| crate::error::code::EIO)?;
-        self.inner.read(words).map_err(|_| crate::error::code::EIO)
+        let mut write_buf = [0u8; TRANSFER_CHUNK_SIZE];
+        for chunk in words.chunks_mut(TRANSFER_CHUNK_SIZE) {
+            write_buf[..chunk.len()].copy_from_slice(chunk);
+            self.inner
+                .transfer(chunk, &write_buf[..chunk.len()])
+                .map_err(|_| crate::error::code::EIO)?;
+        }
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<(), crate::error::Error> {
@@ -62,11 +68,39 @@ impl<T: blueos_hal::spi::Spi<SpiConfig, ()>> BusInterface for BlockSpi<T> {
     type Region = ();
 
     fn read_region(&self, _region: Self::Region, _buffer: &mut [u8]) -> crate::drivers::Result<()> {
-        todo!()
+        Err(crate::error::code::ENOSYS)
     }
 
     fn write_region(&self, _region: Self::Region, _data: &[u8]) -> crate::drivers::Result<()> {
-        todo!()
+        Err(crate::error::code::ENOSYS)
+    }
+}
+
+#[cfg(use_embedded_hal_v1)]
+impl<T: blueos_hal::spi::Spi<SpiConfig, ()>> ErrorType for BlockSpi<T> {
+    type Error = crate::error::Error;
+}
+
+#[cfg(use_embedded_hal_v1)]
+impl<T: blueos_hal::spi::Spi<SpiConfig, ()>> SpiBus<u8> for BlockSpi<T> {
+    fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+        BlockSpi::read(self, words)
+    }
+
+    fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
+        BlockSpi::write(self, words)
+    }
+
+    fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
+        BlockSpi::transfer(self, read, write)
+    }
+
+    fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+        BlockSpi::transfer_in_place(self, words)
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        BlockSpi::flush(self)
     }
 }
 
@@ -78,7 +112,7 @@ impl<T: blueos_hal::spi::Spi<SpiConfig, ()>> ErrorType for BusWrapper<BlockSpi<T
 #[cfg(use_embedded_hal_v1)]
 impl embedded_hal::spi::Error for crate::error::Error {
     fn kind(&self) -> embedded_hal::spi::ErrorKind {
-        // FIXME: Map the error code to embedded_hal::spi::ErrorKind
+        // No embedded-hal variant represents errno values.
         embedded_hal::spi::ErrorKind::Other
     }
 }
@@ -86,22 +120,27 @@ impl embedded_hal::spi::Error for crate::error::Error {
 #[cfg(use_embedded_hal_v1)]
 impl<T: blueos_hal::spi::Spi<SpiConfig, ()>> SpiBus<u8> for BusWrapper<BlockSpi<T>> {
     fn read(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+        let _transaction = self.lock_transaction();
         self.0.lock().read(words)
     }
 
     fn write(&mut self, words: &[u8]) -> Result<(), Self::Error> {
+        let _transaction = self.lock_transaction();
         self.0.lock().write(words)
     }
 
     fn transfer(&mut self, read: &mut [u8], write: &[u8]) -> Result<(), Self::Error> {
+        let _transaction = self.lock_transaction();
         self.0.lock().transfer(read, write)
     }
 
     fn transfer_in_place(&mut self, words: &mut [u8]) -> Result<(), Self::Error> {
+        let _transaction = self.lock_transaction();
         self.0.lock().transfer_in_place(words)
     }
 
     fn flush(&mut self) -> Result<(), Self::Error> {
+        let _transaction = self.lock_transaction();
         self.0.lock().flush()
     }
 }
@@ -161,42 +200,47 @@ impl<B: BusInterface, CS, D> SpinLockDevice<B, CS, D> {
 #[cfg(use_embedded_hal_v1)]
 impl<B, CS, D> ErrorType for SpinLockDevice<B, CS, D>
 where
-    B: BusInterface,
-    BusWrapper<B>: ErrorType,
+    B: BusInterface + ErrorType,
     CS: OutputPin,
 {
-    type Error = DeviceError<<BusWrapper<B> as ErrorType>::Error, CS::Error>;
+    type Error = DeviceError<B::Error, CS::Error>;
 }
 
 #[cfg(use_embedded_hal_v1)]
 impl<Word, B, CS, D> SpiDevice<Word> for SpinLockDevice<B, CS, D>
 where
     Word: Copy + 'static,
-    B: BusInterface,
-    BusWrapper<B>: SpiBus<Word>,
+    B: BusInterface + SpiBus<Word>,
     CS: OutputPin,
     D: DelayNs,
 {
     fn transaction(&mut self, operations: &mut [Operation<'_, Word>]) -> Result<(), Self::Error> {
+        let _transaction = self.bus.lock_transaction();
         self.cs.set_low().map_err(DeviceError::Cs)?;
 
         let op_res = operations.iter_mut().try_for_each(|op| match op {
-            Operation::Read(buf) => self.bus.read(buf).map_err(DeviceError::Spi),
-            Operation::Write(buf) => self.bus.write(buf).map_err(DeviceError::Spi),
-            Operation::Transfer(read, write) => {
-                self.bus.transfer(read, write).map_err(DeviceError::Spi)
-            }
-            Operation::TransferInPlace(buf) => {
-                self.bus.transfer_in_place(buf).map_err(DeviceError::Spi)
-            }
+            Operation::Read(buf) => self.bus.0.lock().read(buf).map_err(DeviceError::Spi),
+            Operation::Write(buf) => self.bus.0.lock().write(buf).map_err(DeviceError::Spi),
+            Operation::Transfer(read, write) => self
+                .bus
+                .0
+                .lock()
+                .transfer(read, write)
+                .map_err(DeviceError::Spi),
+            Operation::TransferInPlace(buf) => self
+                .bus
+                .0
+                .lock()
+                .transfer_in_place(buf)
+                .map_err(DeviceError::Spi),
             Operation::DelayNs(ns) => {
-                self.bus.flush().map_err(DeviceError::Spi)?;
+                self.bus.0.lock().flush().map_err(DeviceError::Spi)?;
                 self.delay.delay_ns(*ns);
                 Ok(())
             }
         });
 
-        let flush_res = self.bus.flush();
+        let flush_res = self.bus.0.lock().flush();
         let cs_res = self.cs.set_high();
 
         op_res?;
@@ -204,5 +248,122 @@ where
         cs_res.map_err(DeviceError::Cs)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{devices::bus::Bus, sync::SpinLock};
+    use alloc::{boxed::Box, vec::Vec};
+    use blueos_hal::{Configuration, PlatPeri};
+    use blueos_test_macro::test;
+    use embedded_hal::digital::ErrorType as DigitalErrorType;
+
+    struct MockSpi {
+        writes: SpinLock<Vec<u8>>,
+    }
+
+    impl MockSpi {
+        fn new() -> Self {
+            Self {
+                writes: SpinLock::new(Vec::new()),
+            }
+        }
+    }
+
+    impl PlatPeri for MockSpi {}
+
+    impl Configuration<SpiConfig> for MockSpi {
+        type Target = ();
+
+        fn configure(&self, _config: &SpiConfig) -> blueos_hal::err::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl blueos_hal::spi::Spi<SpiConfig, ()> for MockSpi {
+        fn transfer(&self, read: &mut [u8], write: &[u8]) -> blueos_hal::err::Result<()> {
+            self.writes.lock().extend_from_slice(write);
+            for (dst, src) in read.iter_mut().zip(write.iter()) {
+                *dst = src.wrapping_add(1);
+            }
+            Ok(())
+        }
+
+        fn read(&self, buf: &mut [u8]) -> blueos_hal::err::Result<()> {
+            buf.fill(0);
+            Ok(())
+        }
+
+        fn write(&self, buf: &[u8]) -> blueos_hal::err::Result<()> {
+            self.writes.lock().extend_from_slice(buf);
+            Ok(())
+        }
+    }
+    struct LockCheckingCs {
+        bus: BusWrapper<BlockSpi<MockSpi>>,
+        observations: Vec<bool>,
+    }
+
+    impl DigitalErrorType for LockCheckingCs {
+        type Error = core::convert::Infallible;
+    }
+
+    impl OutputPin for LockCheckingCs {
+        fn set_low(&mut self) -> Result<(), Self::Error> {
+            self.observations.push(self.bus.1.count() != 0);
+            Ok(())
+        }
+
+        fn set_high(&mut self) -> Result<(), Self::Error> {
+            self.observations.push(self.bus.1.count() != 0);
+            Ok(())
+        }
+    }
+
+    struct NoopDelay;
+
+    impl DelayNs for NoopDelay {
+        fn delay_ns(&mut self, _ns: u32) {}
+    }
+
+    #[test]
+    fn test_transfer_in_place_is_full_duplex() {
+        let mock = Box::leak(Box::new(MockSpi::new()));
+        let mut spi = BlockSpi { inner: mock };
+        let mut words = [0u8; 70];
+        for (index, word) in words.iter_mut().enumerate() {
+            *word = index as u8;
+        }
+        let expected = words;
+
+        spi.transfer_in_place(&mut words).unwrap();
+
+        assert_eq!(mock.writes.lock().as_slice(), expected);
+        for (actual, original) in words.iter().zip(expected.iter()) {
+            assert_eq!(*actual, original.wrapping_add(1));
+        }
+    }
+
+    #[test]
+    fn test_device_holds_bus_lock_for_entire_transaction() {
+        let mock = Box::leak(Box::new(MockSpi::new()));
+        let bus = Bus::new(BlockSpi { inner: mock });
+        let cs = LockCheckingCs {
+            bus: bus.intf.clone(),
+            observations: Vec::new(),
+        };
+        let mut device = SpinLockDevice::new(bus.intf.clone(), cs, NoopDelay).unwrap();
+        let mut operations = [Operation::Write(&[0x9f])];
+
+        device.transaction(&mut operations).unwrap();
+
+        let expected = if crate::scheduler::is_schedule_ready() {
+            [false, true, true]
+        } else {
+            [false, false, false]
+        };
+        assert_eq!(device.cs.observations, expected);
     }
 }

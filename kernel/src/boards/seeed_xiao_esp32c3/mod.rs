@@ -181,7 +181,10 @@ crate::define_peripheral! {
      blueos_driver::interrupt_controller::esp32_intc::Esp32Intc::new(0x600c_2000)),
     (spi2, Spi2Impl, Spi2Impl::new()),
     (flash_cs, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
-     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(3)),
+     unsafe {
+         // SAFETY: GPIO 3 is less than 26.
+         blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new_unchecked(3)
+     }),
 }
 
 crate::define_pin_states!(
@@ -193,9 +196,14 @@ crate::define_pin_states!(
 );
 
 #[cfg(enable_block)]
+type FlashConfig = crate::drivers::flash::spi_flash::SpiFlashConfig<
+    blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+>;
+
+#[cfg(enable_block)]
 crate::define_bus! {
     (spi2_bus, crate::devices::spi_core::block_spi::BlockSpi<Spi2Impl>,
-        (flash, crate::drivers::flash::spi_flash::SpiFlashConfig<blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>,
+        (flash, FlashConfig,
             crate::drivers::flash::spi_flash::SpiFlashConfig::new(
                 BLOCK_STORAGE_DEVICE_NAME,
                 get_device!(flash_cs),
