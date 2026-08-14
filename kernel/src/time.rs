@@ -123,6 +123,13 @@ pub fn now() -> Duration {
     from_clock_cycles(ClockImpl::estimate_current_cycles())
 }
 
+pub fn busy_wait(duration: Duration) {
+    let deadline = now().saturating_add(duration);
+    while now() < deadline {
+        core::hint::spin_loop();
+    }
+}
+
 pub fn from_clock_cycles(cycles: u64) -> Duration {
     let hz = ClockImpl::hz();
     let secs = cycles / hz;
