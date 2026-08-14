@@ -20,6 +20,8 @@ use blueos_driver::spi::SpiConfig;
 #[cfg(all(use_embedded_hal_v1, spi_core))]
 use blueos_hal::{gpio::OutputPin, spi::Spi, PlatPeri};
 use core::cmp::min;
+#[cfg(all(use_embedded_hal_v1, spi_core))]
+use core::time::Duration;
 use embedded_hal::spi::SpiDevice;
 use embedded_io::ErrorKind;
 
@@ -28,7 +30,7 @@ use crate::{
         block::{Block, BlockDriverOps, BlockError, ErrorType},
         DeviceManager,
     },
-    drivers::flash::spi_flash_cmd::{FlashError, SpiFlashCmd},
+    drivers::flash::spi_flash_cmd::{FlashError, SpiFlashCmd, SpiFlashTimeouts},
     sync::SpinLock,
 };
 #[cfg(all(use_embedded_hal_v1, spi_core))]
@@ -38,6 +40,7 @@ use crate::{
         spi_core::{block_spi::BlockSpi, ExclusiveSpiWithCs},
         DeviceData,
     },
+    drivers::flash::spi_flash_cmd::configured_poll_interval,
     drivers::{DriverModule, InitDriver},
 };
 
@@ -306,12 +309,29 @@ where
 pub struct SpiFlashConfig<G: OutputPin> {
     pub name: &'static str,
     pub cs: &'static G,
+    timeouts: SpiFlashTimeouts,
+    poll_interval: Duration,
 }
 
 #[cfg(all(use_embedded_hal_v1, spi_core))]
 impl<G: OutputPin> SpiFlashConfig<G> {
     pub const fn new(name: &'static str, cs: &'static G) -> Self {
-        SpiFlashConfig { name, cs }
+        SpiFlashConfig {
+            name,
+            cs,
+            timeouts: SpiFlashTimeouts::configured(),
+            poll_interval: configured_poll_interval(),
+        }
+    }
+
+    pub const fn with_timeouts(mut self, timeouts: SpiFlashTimeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    pub const fn with_poll_interval(mut self, poll_interval: Duration) -> Self {
+        self.poll_interval = poll_interval;
+        self
     }
 }
 
@@ -325,7 +345,8 @@ where
 
     fn init(self, bus: &Bus<BlockSpi<T, G>>) -> crate::drivers::Result<Self::Data> {
         let spi_device = ExclusiveSpiWithCs::new(bus.intf.clone(), self.cs);
-        let mut flash_cmd = SpiFlashCmd::new(spi_device);
+        let mut flash_cmd =
+            SpiFlashCmd::new_with_poll_interval(spi_device, self.timeouts, self.poll_interval);
 
         let jedec_id = flash_cmd.jedec_id().map_err(|error| match error {
             FlashError::NotReady | FlashError::JedecMismatch { .. } => crate::error::code::ENODEV,
@@ -391,6 +412,8 @@ where
                     Ok(SpiFlashConfig {
                         name: config.name,
                         cs: config.cs,
+                        timeouts: config.timeouts,
+                        poll_interval: config.poll_interval,
                     })
                 } else {
                     Err(crate::error::code::ENODEV)
