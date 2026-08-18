@@ -69,8 +69,8 @@ impl TcpSocket {
         };
 
         let tcp_socket = {
-            let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; 1024]);
-            let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; 1024]);
+            let tcp_rx_buffer = tcp::SocketBuffer::new(vec![0; 4096]);
+            let tcp_tx_buffer = tcp::SocketBuffer::new(vec![0; 4096]);
             tcp::Socket::new(tcp_rx_buffer, tcp_tx_buffer)
         };
 

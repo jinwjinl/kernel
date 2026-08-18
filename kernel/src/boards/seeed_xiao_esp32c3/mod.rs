@@ -182,8 +182,8 @@ crate::define_peripheral! {
     (spi2, Spi2Impl, Spi2Impl::new()),
     (flash_cs, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
      unsafe {
-         // SAFETY: GPIO 3 is less than 26.
-         blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new_unchecked(3)
+         // SAFETY: GPIO 1 is less than 26.
+         blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new_unchecked(1)
      }),
 }
 
@@ -192,7 +192,7 @@ crate::define_pin_states!(
     (8, 1, false, false, false, 2, Some(63), None, false), // SCK  FSPICLK_OUT
     (9, 1, true, false, false, 2, None, Some(64), false),  // MISO FSPIQ_IN
     (10, 1, false, false, false, 2, Some(65), None, false), // MOSI FSPID_OUT
-    (3, 1, false, true, false, 2, None, None, true),       // CS   GPIO output, pull-up
+    (1, 1, false, true, false, 2, None, None, true),       // CS   GPIO output, pull-up
 );
 
 #[cfg(enable_block)]
@@ -218,11 +218,12 @@ pub const BLOCK_STORAGE_DEVICE_NAME: &str = "flash-storage";
 pub const BLOCK_STORAGE_MOUNT_POINT: &str = "data";
 
 // ESP32-C3 on-chip flash and MMU layout.
-pub const LOADABLE_REGION_BASE: u32 = 0x0020_0000;
-pub const LOADABLE_REGION_SIZE: u32 = 0x0010_0000;
+pub const LOADABLE_REGION_BASE: u32 = 0x0011_0000;
+pub const LOADABLE_REGION_SIZE: u32 = 0x002F_0000;
 pub const LOADABLE_REGION_END: u32 = LOADABLE_REGION_BASE + LOADABLE_REGION_SIZE;
 pub const IROM_VADDR_BASE: u32 = 0x4200_0000;
 pub const DROM_VADDR_BASE: u32 = 0x3C00_0000;
+pub const DROM_VADDR_END: u32 = 0x3C80_0000;
 pub const FLASH_MMU_PAGE_SIZE: u32 = 0x0001_0000;
 
 pub const BLOCK_STORAGE_POLICY: crate::boards::BlockStoragePolicy =

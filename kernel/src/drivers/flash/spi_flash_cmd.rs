@@ -275,17 +275,23 @@ impl<SPI: SpiDevice<u8>> SpiFlashCmd<SPI> {
 
     fn wait_busy(&mut self, timeout: Duration) -> Result<(), FlashError> {
         let deadline = time::now().saturating_add(timeout);
-        let poll_interval = self.poll_interval;
-        self.wait_busy_with(
-            || time::now() >= deadline,
-            || {
-                if scheduler::is_schedule_ready() {
-                    scheduler::yield_me();
-                }
-                let remaining = deadline.saturating_sub(time::now());
-                time::busy_wait(core::cmp::min(poll_interval, remaining));
-            },
-        )
+        loop {
+            let status = self.read_status()?;
+            if status & 0x01 == 0 {
+                return Ok(());
+            }
+            if time::now() >= deadline {
+                return Err(FlashError::Timeout);
+            }
+            // Let the SPI controller delay in hardware instead of burning CPU on
+            // busy_wait — on single-core ESP32-C3 a spin here starves the net thread.
+            let _ = self
+                .spi
+                .transaction(&mut [Operation::DelayNs(1_000_000)]);
+            if scheduler::is_schedule_ready() {
+                scheduler::yield_me();
+            }
+        }
     }
 
     fn wait_busy_with(
