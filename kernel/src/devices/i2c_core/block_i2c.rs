@@ -17,6 +17,8 @@ use blueos_hal::PlatPeri;
 
 use crate::devices::bus::{BusInterface, BusWrapper};
 
+const DEFAULT_I2C_BAUDRATE: u32 = 400_000;
+
 pub struct BlockI2c<T: PlatPeri> {
     inner: &'static T,
 }
@@ -24,9 +26,24 @@ pub struct BlockI2c<T: PlatPeri> {
 impl<T: blueos_hal::i2c::I2c<I2cConfig, ()>> BlockI2c<T> {
     pub fn new(inner: &'static T) -> Result<Self, blueos_hal::err::HalError> {
         inner.configure(&I2cConfig {
-            baudrate: 1_000_000,
+            // FT6336U supports Fast-mode; use it to keep touch polling latency low.
+            baudrate: DEFAULT_I2C_BAUDRATE,
         })?;
         Ok(BlockI2c { inner })
+    }
+
+    fn report_error(
+        &self,
+        operation: &str,
+        error: blueos_hal::err::HalError,
+    ) -> crate::error::Error {
+        log::warn!(
+            "I2C {} failed: {:?}, controller error status: 0x{:08x}",
+            operation,
+            error,
+            self.inner.get_error_status()
+        );
+        crate::error::code::EIO
     }
 
     pub fn write_bytes(
@@ -103,14 +120,14 @@ impl<T: blueos_hal::i2c::I2c<I2cConfig, ()>> BlockI2c<T> {
 
 impl<T: blueos_hal::i2c::I2c<I2cConfig, ()>> BusInterface for BlockI2c<T> {}
 
-#[cfg(use_bme280)]
+#[cfg(use_embedded_hal_v1)]
 impl<T: blueos_hal::i2c::I2c<I2cConfig, ()>> embedded_hal::i2c::ErrorType
     for BusWrapper<BlockI2c<T>>
 {
     type Error = crate::error::Error;
 }
 
-#[cfg(use_bme280)]
+#[cfg(use_embedded_hal_v1)]
 impl embedded_hal::i2c::Error for crate::error::Error {
     fn kind(&self) -> embedded_hal::i2c::ErrorKind {
         match *self {
@@ -120,14 +137,14 @@ impl embedded_hal::i2c::Error for crate::error::Error {
     }
 }
 
-#[cfg(use_bme280)]
+#[cfg(use_embedded_hal_v1)]
 impl<T: blueos_hal::i2c::I2c<I2cConfig, ()>> embedded_hal::i2c::I2c for BusWrapper<BlockI2c<T>> {
     fn transaction(
         &mut self,
         address: u8,
         operations: &mut [embedded_hal::i2c::Operation<'_>],
     ) -> Result<(), Self::Error> {
-        let mut operations = operations.into_iter().peekable();
+        let mut operations = operations.iter_mut().peekable();
         // FIXME: More efficient implementation
         let inner = self.0.lock();
 

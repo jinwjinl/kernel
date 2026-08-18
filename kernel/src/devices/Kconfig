@@ -4,6 +4,10 @@ config SPI_CORE
     default n
     bool "enable spi core"
 
+config I2C_CORE
+    default n
+    bool "enable i2c core"
+
 config SPI_FLASH_SECTOR_SIZE
     int "SPI flash logical sector size"
     default 512

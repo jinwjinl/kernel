@@ -19,6 +19,49 @@ choice
           Set irq priority bits to 8.
 endchoice
 
+config LCD
+    bool "Enable LCD device"
+    default n
+    help
+      Enable LCD module
+
+config FT6336U
+    bool "Enable touch screen device"
+    default n
+    help
+      Enable touch screen
+
+config GPIO
+    bool "Enable gpio device"
+    default n
+    help
+      Enable gpio device
+
+if LCD
+
+  choice
+    prompt "LCD controller"
+    default ST7789
+
+    config ST7789
+        bool "Enable LCD ST7789"
+        help
+          Enable the ST7789 LCD controller.
+
+    config ST7796
+        bool "Enable LCD ST7796"
+        help
+          Enable the ST7796 LCD controller.
+  endchoice
+
+endif
+
+config BME280
+    bool "BME280 Sensor"
+    default n
+    help
+      Enable BME280
+
 config USE_EMBEDDED_HAL_V1
     bool "Impl embedded-hal-1.0.0 for driver"
     default y
@@ -29,6 +72,7 @@ config SOC_ESP32C3
     bool "Esp32c3"
     default y
     select RISCV
+    select I2C_CORE
 
 config NUM_IRQS
     default 31

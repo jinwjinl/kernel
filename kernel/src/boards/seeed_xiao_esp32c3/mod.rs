@@ -20,9 +20,13 @@ use crate::{
 };
 use blueos_driver::{
     interrupt_controller::Interrupt, power::esp32c3_power_domain::PowerDomain,
-    uart::esp32_usb_serial::Esp32UsbSerialIsr,
+    spi::esp32_spi::Esp32Spi2, uart::esp32_usb_serial::Esp32UsbSerialIsr,
 };
 use blueos_hal::{isr::IsrDesc, Has8bitDataReg};
+
+const LED_DEVICE_MAJOR: usize = 242;
+const LED_B_DEVICE_MINOR: usize = 0;
+const LED_R_DEVICE_MINOR: usize = 1;
 
 // FIXME: Only support unit0 for now
 pub type ClockImpl =
@@ -180,42 +184,67 @@ crate::define_peripheral! {
     (intc, blueos_driver::interrupt_controller::esp32_intc::Esp32Intc,
      blueos_driver::interrupt_controller::esp32_intc::Esp32Intc::new(0x600c_2000)),
     (spi2, Spi2Impl, Spi2Impl::new()),
+    (i2c0, blueos_driver::i2c::esp32_i2c::Esp32I2c,
+     blueos_driver::i2c::esp32_i2c::Esp32I2c::new(0x6001_3000, 0x600C_0000, 40_000_000)),
+    (dc_pin, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(5)),
+    (rst_pin, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(4)),
+    (touch_rst_pin, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(21)),
+    (lcd_cs, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(20)),
+    (led_b, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(2)),
+    (led_r, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(3)),
     (flash_cs, blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
-     unsafe {
-         // SAFETY: GPIO 1 is less than 26.
-         blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new_unchecked(1)
-     }),
+     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin::new(1)),
 }
-
-crate::define_pin_states!(
-    blueos_driver::pinctrl::esp32_pinctrl::Esp32IoMuxPinctrl,
-    (8, 1, false, false, false, 2, Some(63), None, false), // SCK  FSPICLK_OUT
-    (9, 1, true, false, false, 2, None, Some(64), false),  // MISO FSPIQ_IN
-    (10, 1, false, false, false, 2, Some(65), None, false), // MOSI FSPID_OUT
-    (1, 1, false, true, false, 2, None, None, true),       // CS   GPIO output, pull-up
-);
 
 #[cfg(enable_block)]
 type FlashConfig = crate::drivers::flash::spi_flash::SpiFlashConfig<
     blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
 >;
 
-#[cfg(enable_block)]
 crate::define_bus! {
     (spi2_bus, crate::devices::spi_core::block_spi::BlockSpi<
         Spi2Impl,
-        blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin
+        blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
     >,
+        #[cfg(enable_block)]
         (flash, FlashConfig,
             crate::drivers::flash::spi_flash::SpiFlashConfig::new(
                 BLOCK_STORAGE_DEVICE_NAME,
                 get_device!(flash_cs),
             )),
-    )
+        #[cfg(st7789)]
+        (st7789, crate::drivers::lcd::st7789::St7789Config<blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>,
+            crate::drivers::lcd::st7789::St7789Config::<blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin> {
+                rst: get_device!(rst_pin),
+                dc: get_device!(dc_pin),
+                cs: Some(get_device!(lcd_cs)),
+            }
+        ),
+        #[cfg(st7796)]
+        (st7796, crate::drivers::lcd::st7796::St7796Config<blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin>,
+            crate::drivers::lcd::st7796::St7796Config::<blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin> {
+                rst: get_device!(rst_pin),
+                dc: get_device!(dc_pin),
+                cs: Some(get_device!(lcd_cs)),
+                orientation: mipidsi::options::Orientation::new()
+                    .rotate(mipidsi::options::Rotation::Deg0)
+                    .flip_horizontal(),
+            }
+        ),
+    ),
 }
 
 pub const BLOCK_STORAGE_DEVICE_NAME: &str = "flash-storage";
 pub const BLOCK_STORAGE_MOUNT_POINT: &str = "data";
+
+pub const BLOCK_STORAGE_POLICY: crate::boards::BlockStoragePolicy =
+    crate::boards::BlockStoragePolicy::Optional;
 
 // ESP32-C3 on-chip flash and MMU layout.
 pub const LOADABLE_REGION_BASE: u32 = 0x0011_0000;
@@ -226,26 +255,23 @@ pub const DROM_VADDR_BASE: u32 = 0x3C00_0000;
 pub const DROM_VADDR_END: u32 = 0x3C80_0000;
 pub const FLASH_MMU_PAGE_SIZE: u32 = 0x0001_0000;
 
-pub const BLOCK_STORAGE_POLICY: crate::boards::BlockStoragePolicy =
-    crate::boards::BlockStoragePolicy::Optional;
-
-#[cfg(enable_block)]
-type FlashSpiBus = crate::devices::bus::Bus<
+#[cfg(spi_core)]
+type Spi2Bus = crate::devices::bus::Bus<
     crate::devices::spi_core::block_spi::BlockSpi<
         Spi2Impl,
         blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
     >,
 >;
 
-#[cfg(enable_block)]
-static FLASH_SPI_BUS: spin::Once<alloc::sync::Arc<FlashSpiBus>> = spin::Once::new();
+#[cfg(spi_core)]
+static SPI2_BUS: spin::Once<alloc::sync::Arc<Spi2Bus>> = spin::Once::new();
 
-#[cfg(enable_block)]
-fn init_flash_spi_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<FlashSpiBus>> {
+#[cfg(spi_core)]
+fn init_spi2_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<Spi2Bus>> {
     use crate::devices::{bus::Bus, spi_core::block_spi::BlockSpi};
     use blueos_driver::spi::SpiConfig;
 
-    if let Some(spi_bus) = FLASH_SPI_BUS.get() {
+    if let Some(spi_bus) = SPI2_BUS.get() {
         return Ok(spi_bus);
     }
 
@@ -255,23 +281,8 @@ fn init_flash_spi_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<Flas
             blueos_hal::err::HalError::Timeout => crate::error::code::ETIMEDOUT,
             _ => crate::error::code::EIO,
         })?;
-    FLASH_SPI_BUS.call_once(|| alloc::sync::Arc::new(Bus::new(block_spi)));
-    FLASH_SPI_BUS.get().ok_or(crate::error::code::EIO)
-}
-
-#[cfg(enable_block)]
-pub(crate) fn init_block_devices() -> crate::drivers::Result<()> {
-    use crate::drivers::InitDriver;
-
-    let spi2_bus = init_flash_spi_bus()?;
-    for device in crate::boards::get_bus_devices!(spi2_bus) {
-        spi2_bus.register_device(device)?;
-    }
-    let driver =
-        spi2_bus.probe_driver(&crate::drivers::flash::spi_flash::SpiFlashDriverModule::<
-            blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
-        >::new())?;
-    driver.init(spi2_bus)
+    SPI2_BUS.call_once(|| alloc::sync::Arc::new(Bus::new(block_spi)));
+    SPI2_BUS.get().ok_or(crate::error::code::EIO)
 }
 
 #[inline(always)]
@@ -286,3 +297,95 @@ static ESP32_USB_SERIAL_ISR: Esp32UsbSerialIsr<0x6004_3000, crate::drivers::seri
         tx_isr: Some(crate::drivers::serial::Serial::xmitchars),
         rx_isr: Some(crate::drivers::serial::Serial::recvchars),
     };
+
+crate::define_pin_states!(
+    blueos_driver::pinctrl::esp32_pinctrl::Esp32IoMuxPinctrl,
+    (6, 1, true, true, false, 2, Some(54), Some(54), false, true), // I2C0 SDA
+    (7, 1, true, true, false, 2, Some(53), Some(53), false, true), // I2C0 SCL
+    (8, 1, false, false, false, 2, Some(63), None, false, false),  // SCK
+    (9, 1, true, false, false, 2, None, Some(64), false, false),   // MISO
+    (10, 1, false, false, false, 2, Some(65), None, false, false), // MOSI
+    (20, 1, false, true, false, 2, None, None, true, false),       // lcd cs
+    (5, 1, false, true, false, 2, None, None, true, false),        // lcd dc
+    (4, 1, false, true, false, 2, None, None, true, false),        // lcd rst
+    (21, 1, false, true, false, 2, None, None, true, false),       // touch rst
+    (1, 1, false, true, false, 2, None, None, true, false),        // flash cs
+    (2, 1, false, true, false, 2, None, None, true, false),        // led blue
+    (3, 1, false, true, false, 2, None, None, true, false),        // led red
+);
+
+#[cfg(spi_core)]
+pub(crate) fn init_spi_bus() {
+    use crate::drivers::InitDriver;
+
+    let spi2_bus = init_spi2_bus().expect("Failed to init SPI2 bus");
+    for device in crate::boards::get_bus_devices!(spi2_bus) {
+        spi2_bus
+            .register_device(device)
+            .expect("Failed to register SPI device");
+    }
+
+    #[cfg(enable_block)]
+    {
+        let result = spi2_bus
+            .probe_driver(&crate::drivers::flash::spi_flash::SpiFlashDriverModule::<
+                blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+            >::new())
+            .and_then(|driver| driver.init(spi2_bus));
+        if let Err(error) = result {
+            if !BLOCK_STORAGE_POLICY.allows_missing() || error != crate::error::code::ENODEV {
+                panic!("Block storage initialization failed: {}", error);
+            }
+            log::warn!("SPI flash not present, skipping: {}", error);
+        }
+    }
+
+    #[cfg(st7789)]
+    {
+        if let Ok(driver) =
+            spi2_bus.probe_driver(&crate::drivers::lcd::st7789::St7789DriverModule::<
+                blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+            >::new())
+        {
+            if let Err(error) = driver.init(spi2_bus) {
+                log::warn!("Failed to init ST7789 driver: {}", error);
+            }
+        }
+    }
+
+    #[cfg(st7796)]
+    {
+        if let Ok(driver) =
+            spi2_bus.probe_driver(&crate::drivers::lcd::st7796::St7796DriverModule::<
+                blueos_driver::gpio::esp32_gpio::Esp32GpioOutputPin,
+            >::new())
+        {
+            if let Err(error) = driver.init(spi2_bus) {
+                log::warn!("Failed to init ST7796 driver: {}", error);
+            }
+        }
+    }
+}
+
+pub(crate) fn init_i2c_bus() {}
+
+pub(crate) fn init_gpio() {
+    crate::devices::gpio::GeneralGpio::new(
+        get_device!(led_b),
+        Some(crate::devices::gpio::Level::High),
+    )
+    .register(
+        alloc::string::String::from("led_b"),
+        crate::devices::DeviceId::new(LED_DEVICE_MAJOR, LED_B_DEVICE_MINOR),
+    )
+    .expect("Failed to register led_b");
+    crate::devices::gpio::GeneralGpio::new(
+        get_device!(led_r),
+        Some(crate::devices::gpio::Level::High),
+    )
+    .register(
+        alloc::string::String::from("led_r"),
+        crate::devices::DeviceId::new(LED_DEVICE_MAJOR, LED_R_DEVICE_MINOR),
+    )
+    .expect("Failed to register led_r");
+}
