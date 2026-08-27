@@ -16,7 +16,11 @@
 
 use core::time::Duration;
 
-use crate::{scheduler, time};
+use crate::{
+    scheduler,
+    sync::KernelDelay,
+    time::{self, Tick},
+};
 use embedded_hal::{
     delay::DelayNs,
     spi::{ErrorKind, Operation, SpiDevice},
@@ -190,7 +194,7 @@ impl<SPI: SpiDevice<u8>> SpiFlashCmd<SPI> {
                 Operation::Write(data),
             ])
             .map_err(spi_err_to_flash)?;
-        self.wait_busy(self.timeouts.page_program)?;
+        self.wait_busy_compact(self.timeouts.page_program)?;
         Ok(())
     }
 
@@ -283,14 +287,21 @@ impl<SPI: SpiDevice<u8>> SpiFlashCmd<SPI> {
             if time::now() >= deadline {
                 return Err(FlashError::Timeout);
             }
-            // Let the SPI controller delay in hardware instead of burning CPU on
-            // busy_wait — on single-core ESP32-C3 a spin here starves the net thread.
-            let _ = self
-                .spi
-                .transaction(&mut [Operation::DelayNs(1_000_000)]);
-            if scheduler::is_schedule_ready() {
-                scheduler::yield_me();
+            scheduler::suspend_me_for::<()>(Tick(1), None);
+        }
+    }
+
+    fn wait_busy_compact(&mut self, timeout: Duration) -> Result<(), FlashError> {
+        let deadline = time::now().saturating_add(timeout);
+        loop {
+            let status = self.read_status()?;
+            if status & 0x01 == 0 {
+                return Ok(());
             }
+            if time::now() >= deadline {
+                return Err(FlashError::Timeout);
+            }
+            KernelDelay.delay_ns(self.poll_interval.as_nanos() as u32);
         }
     }
 
