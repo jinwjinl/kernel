@@ -14,7 +14,13 @@
 
 use crate::net::link::wifi_ops::Ssid;
 use enumset::{EnumSet, EnumSetType};
-use esp_wifi_sys_esp32c3::{c_types, include};
+// Select the esp-wifi-sys crate by SoC: C3/C6 share the same bindgen source with
+// identical API names, unified here under the alias esp_wifi_sys.
+use esp_wifi_sys::{c_types, include};
+#[cfg(soc_esp32c3)]
+use esp_wifi_sys_esp32c3 as esp_wifi_sys;
+#[cfg(soc_esp32c6)]
+use esp_wifi_sys_esp32c6 as esp_wifi_sys;
 use num_derive::FromPrimitive;
 
 // This code is modified from [esp-radio] https://github.com/esp-rs/esp-hal/blob/main/esp-radio/src/wifi/event.rs
@@ -1021,7 +1027,16 @@ pub enum EventInfo {
 
     // we don't currently support NAN - and there is no intention right now to change that
     /// Wi-Fi home channel change, doesn't occur when scanning.
-    HomeChannelChange,
+    HomeChannelChange {
+        /// Previous primary home channel.
+        old_chan: u8,
+        /// Previous secondary channel configuration.
+        old_snd: u32,
+        /// New primary home channel.
+        new_chan: u8,
+        /// New secondary channel configuration.
+        new_snd: u32,
+    },
 }
 
 impl EventInfo {
@@ -1235,7 +1250,13 @@ impl EventInfo {
                 Some(EventInfo::BroadcastTargetWakeTimeTeardown)
             }
             WifiEvent::HomeChannelChange => {
-                Some(EventInfo::HomeChannelChange)
+                let ev = unsafe { HomeChannelChange::from_raw_event_data(payload) };
+                Some(EventInfo::HomeChannelChange {
+                    old_chan: ev.old_chan(),
+                    old_snd: ev.old_snd(),
+                    new_chan: ev.new_chan(),
+                    new_snd: ev.new_snd(),
+                })
             }
             _ => None,
         }

@@ -123,6 +123,21 @@ impl NetworkManager {
         self.socket_maps.get(&socket_fd).cloned()
     }
 
+    pub fn insert_posix_socket(
+        &mut self,
+        socket_fd: SocketFd,
+        socket: Rc<RefCell<dyn PosixSocket + 'static>>,
+    ) {
+        self.socket_maps.insert(socket_fd, socket);
+    }
+
+    pub fn remove_posix_socket(
+        &mut self,
+        socket_fd: SocketFd,
+    ) -> Option<Rc<RefCell<dyn PosixSocket + 'static>>> {
+        self.socket_maps.remove(&socket_fd)
+    }
+
     pub fn loop_within_single_thread<F>(
         network_manager: Rc<RefCell<NetworkManager>>,
         timeout_millis: usize,

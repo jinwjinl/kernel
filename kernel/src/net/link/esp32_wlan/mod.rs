@@ -33,15 +33,31 @@ use crate::{
     scheduler, thread,
     thread::{Entry, SystemThreadStorage, ThreadKind, ThreadNode},
 };
-use alloc::{collections::VecDeque, string::String, vec, vec::Vec};
+use alloc::{string::String, vec, vec::Vec};
 use api::*;
 use core::{
+    cell::UnsafeCell,
     mem::MaybeUninit,
     ptr::addr_of,
     sync::atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use esp_hal::ram;
-use esp_wifi_sys_esp32c3::{
+// The wifi-sys crate is selected per SoC: the c3/c6 crates are same-source bindgen
+// artifacts with identical API names (both expose pub mod c_types / pub mod include,
+// same symbol set, verified field-by-field against include.rs). Here we alias both
+// to esp_wifi_sys so the use statements and call sites below need not care c3 vs c6.
+#[cfg(soc_esp32c3)]
+use esp_wifi_sys_esp32c3 as esp_wifi_sys;
+#[cfg(soc_esp32c6)]
+use esp_wifi_sys_esp32c6 as esp_wifi_sys;
+// Factory MAC read selects a different hwinfo submodule per SoC (C3/C6 have
+// different eFuse base addresses, but the mac() signature is identical): alias
+// uniformly to hwinfo_mac, called below as hwinfo_mac().
+#[cfg(soc_esp32c3)]
+use blueos_driver::hwinfo::esp32c3::mac as hwinfo_mac;
+#[cfg(soc_esp32c6)]
+use blueos_driver::hwinfo::esp32c6::mac as hwinfo_mac;
+use esp_wifi_sys::{
     c_types,
     include::{
         esp_err_t, esp_interface_t_ESP_IF_WIFI_STA, esp_supplicant_init, esp_wifi_connect_internal,
@@ -81,7 +97,68 @@ pub const WIFI_PROTOCOL_11A: u32 = 16;
 pub const WIFI_PROTOCOL_11AC: u32 = 32;
 pub const WIFI_PROTOCOL_11AX: u32 = 64;
 const WIFI_RX_QUEUE_SIZE: usize = 8;
+const WIFI_TX_QUEUE_SIZE: usize = 4;
 const EVENTINFO_CHANNEL_SIZE: usize = 16;
+
+/// Single-producer/single-consumer RX queue. The producer is the Wi-Fi RX
+/// callback and the consumer is the network stack thread. Keeping ownership
+/// in the ring avoids a lock and heap allocation on the RX callback path.
+struct PacketRing<const N: usize> {
+    slots: [UnsafeCell<MaybeUninit<PacketBuffer>>; N],
+    head: AtomicUsize,
+    tail: AtomicUsize,
+}
+
+unsafe impl<const N: usize> Send for PacketRing<N> {}
+unsafe impl<const N: usize> Sync for PacketRing<N> {}
+
+impl<const N: usize> PacketRing<N> {
+    const fn new() -> Self {
+        assert!(N > 1);
+        Self {
+            slots: [const { UnsafeCell::new(MaybeUninit::uninit()) }; N],
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+        }
+    }
+
+    #[inline(always)]
+    fn try_push(&self, packet: PacketBuffer) -> Result<(), PacketBuffer> {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Acquire);
+        if head.wrapping_sub(tail) >= N {
+            return Err(packet);
+        }
+
+        unsafe {
+            (*self.slots[head % N].get()).write(packet);
+        }
+        self.head.store(head.wrapping_add(1), Ordering::Release);
+        Ok(())
+    }
+
+    #[inline(always)]
+    fn pop(&self) -> Option<PacketBuffer> {
+        let tail = self.tail.load(Ordering::Relaxed);
+        let head = self.head.load(Ordering::Acquire);
+        if tail == head {
+            return None;
+        }
+
+        let packet = unsafe { (*self.slots[tail % N].get()).assume_init_read() };
+        self.tail.store(tail.wrapping_add(1), Ordering::Release);
+        Some(packet)
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.head.load(Ordering::Acquire) == self.tail.load(Ordering::Acquire)
+    }
+}
+
+static WIFI_RX_RING: PacketRing<WIFI_RX_QUEUE_SIZE> = PacketRing::new();
+static WIFI_TX_INFLIGHT: AtomicUsize = AtomicUsize::new(0);
+static WIFI_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 #[repr(transparent)]
 pub(super) struct InternalEventSender(Sender<event::EventInfo, EVENTINFO_CHANNEL_SIZE>);
@@ -99,11 +176,6 @@ fn get_wlan_singleton() -> &'static WifiController {
     WLAN_SINGLETON.call_once(|| WifiController {
         init_done: AtomicBool::new(false),
         started: AtomicBool::new(false),
-        connected: AtomicBool::new(false),
-        tx_inflight: AtomicUsize::new(0),
-        rx_queue_size: WIFI_RX_QUEUE_SIZE,
-        tx_queue_size: 4,
-        rx_queue: spin::Mutex::new(VecDeque::new()),
     })
 }
 
@@ -114,8 +186,7 @@ pub(crate) unsafe extern "C" fn esp_wifi_tx_done_cb(
     _data_len: *mut u16,
     _tx_status: bool,
 ) {
-    get_wlan_singleton()
-        .tx_inflight
+    WIFI_TX_INFLIGHT
         .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
             Some(x.saturating_sub(1))
         })
@@ -129,31 +200,14 @@ pub(crate) unsafe extern "C" fn recv_cb_sta(
     eb: *mut c_types::c_void,
 ) -> esp_err_t {
     let packet = PacketBuffer { buffer, len, eb };
-    let queued = {
-        let mut queue = get_wlan_singleton().rx_queue.lock();
-        if queue.len() < get_wlan_singleton().rx_queue_size {
-            queue.push_back(packet);
-            true
-        } else {
-            false
-        }
-    };
-
-    if queued {
-        ESP_OK as esp_err_t
-    } else {
-        ESP_ERR_NO_MEM as esp_err_t
+    match WIFI_RX_RING.try_push(packet) {
+        Ok(()) => ESP_OK as esp_err_t,
+        Err(_packet) => ESP_ERR_NO_MEM as esp_err_t,
     }
 }
-
 struct WifiController {
     init_done: AtomicBool,
     started: AtomicBool,
-    connected: AtomicBool,
-    tx_inflight: AtomicUsize,
-    tx_queue_size: usize,
-    rx_queue_size: usize,
-    rx_queue: spin::Mutex<VecDeque<PacketBuffer>>,
 }
 
 impl WifiController {
@@ -259,13 +313,18 @@ impl WifiController {
 
     #[inline(always)]
     fn can_send(&self) -> bool {
-        self.connected.load(Ordering::Acquire)
-            && self.tx_inflight.load(Ordering::SeqCst) < self.tx_queue_size
+        WIFI_CONNECTED.load(Ordering::Acquire)
+            && WIFI_TX_INFLIGHT.load(Ordering::Acquire) < WIFI_TX_QUEUE_SIZE
     }
 
     #[inline(always)]
     fn can_recv(&self) -> bool {
-        self.connected.load(Ordering::Acquire) && !get_wlan_singleton().rx_queue.lock().is_empty()
+        !WIFI_RX_RING.is_empty()
+    }
+
+    #[inline(always)]
+    fn has_pending_rx(&self) -> bool {
+        !WIFI_RX_RING.is_empty()
     }
 }
 
@@ -316,7 +375,7 @@ impl Esp32WlanLink {
     }
 
     pub fn mac_address(&self) -> [u8; 6] {
-        blueos_driver::hwinfo::esp32c3::mac()
+        hwinfo_mac()
     }
 }
 
@@ -334,7 +393,7 @@ impl LinkLayer for Esp32WlanLink {
     }
 
     fn hw_addr(&self) -> Option<super::HwAddr> {
-        Some(HwAddr::from_ethernet(blueos_driver::hwinfo::esp32c3::mac()))
+        Some(HwAddr::from_ethernet(hwinfo_mac()))
     }
 
     fn can_send(&self) -> bool {
@@ -384,7 +443,7 @@ pub struct WifiRxToken {
 
 impl WifiRxToken {
     pub(crate) fn get_packet() -> Option<Self> {
-        let packet = get_wlan_singleton().rx_queue.lock().pop_front()?;
+        let packet = WIFI_RX_RING.pop()?;
         Some(Self { packet })
     }
 }
@@ -413,9 +472,15 @@ impl TxToken for WifiTxToken {
             return result;
         }
 
-        get_wlan_singleton()
-            .tx_inflight
-            .fetch_add(1, Ordering::SeqCst);
+        let reserved = WIFI_TX_INFLIGHT
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |inflight| {
+                (inflight < WIFI_TX_QUEUE_SIZE).then_some(inflight + 1)
+            })
+            .is_ok();
+        if !reserved {
+            return result;
+        }
+
         let ret = unsafe {
             esp_wifi_internal_tx(
                 wifi_interface_t_WIFI_IF_STA,
@@ -425,8 +490,7 @@ impl TxToken for WifiTxToken {
         };
 
         if ret != (ESP_OK as i32) {
-            get_wlan_singleton()
-                .tx_inflight
+            WIFI_TX_INFLIGHT
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |x| {
                     Some(x.saturating_sub(1))
                 })
@@ -452,6 +516,9 @@ impl Device for Esp32WlanLink {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
+        // Drain frames already accepted by the driver even after a link loss.
+        // This releases their RX buffers and prevents the network loop from
+        // spinning forever on a stale queue while TX remains disabled.
         if !self.controller.can_recv() {
             return None;
         }
@@ -470,6 +537,8 @@ impl Device for Esp32WlanLink {
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut caps = smoltcp::phy::DeviceCapabilities::default();
         caps.max_transmission_unit = self.mtu();
+        // Keep egress bursts bounded so the Wi-Fi task gets regular scheduling
+        // opportunities to service beacon reception.
         caps.max_burst_size = Some(1);
         caps.medium = SmoltcpMedium::Ethernet;
         caps
@@ -515,6 +584,28 @@ impl SmoltcpDevice for Esp32WlanLink {
 
     fn poll_smoltcp(&mut self, timestamp: Instant, iface: &mut Interface, sockets: &mut SocketSet) {
         iface.poll(timestamp, self, sockets);
+    }
+
+    fn poll_smoltcp_budgeted(
+        &mut self,
+        timestamp: Instant,
+        iface: &mut Interface,
+        sockets: &mut SocketSet,
+        ingress_budget: usize,
+    ) {
+        for _ in 0..ingress_budget {
+            if matches!(
+                iface.poll_ingress_single(timestamp, self, sockets),
+                smoltcp::iface::PollIngressSingleResult::None
+            ) {
+                break;
+            }
+        }
+        iface.poll_egress(timestamp, self, sockets);
+    }
+
+    fn has_pending_rx(&self) -> bool {
+        self.controller.has_pending_rx()
     }
 }
 
@@ -649,9 +740,9 @@ impl WifiOps for Esp32WlanLink {
             cfg.sta.sort_method = wifi_sort_method_t_WIFI_CONNECT_AP_BY_SIGNAL;
             cfg.sta.threshold.rssi = -99;
             cfg.sta.threshold.authmode = if passphrase.is_empty() {
-                esp_wifi_sys_esp32c3::include::wifi_auth_mode_t_WIFI_AUTH_OPEN
+                esp_wifi_sys::include::wifi_auth_mode_t_WIFI_AUTH_OPEN
             } else {
-                esp_wifi_sys_esp32c3::include::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK
+                esp_wifi_sys::include::wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK
             };
             cfg.sta.threshold.rssi_5g_adjustment = 0;
             cfg.sta.pmf_cfg.capable = true;
@@ -737,19 +828,17 @@ fn esp_api_adapter_init() -> Result<(), NetError> {
         while let Ok(event) = rx.recv().await {
             match event {
                 EventInfo::StationStart => {
-                    log::debug!("Wi-Fi StationStart");
+                    log::info!("WiFi StationStart");
                     // set power save mode to none when connected, otherwise the Wi-Fi will not send data after a while.
                     let ret = unsafe { esp_wifi_set_ps(wifi_ps_type_t_WIFI_PS_NONE) };
                     if ret != (ESP_OK as i32) {
                         log::warn!("esp_wifi_set_ps failed: {}", ret);
                         break;
                     }
-                    get_wlan_singleton().connected.store(true, Ordering::SeqCst);
                 }
                 EventInfo::StationStop => {
-                    get_wlan_singleton()
-                        .connected
-                        .store(false, Ordering::SeqCst);
+                    log::info!("WiFi StationStop");
+                    WIFI_CONNECTED.store(false, Ordering::Release);
                 }
                 EventInfo::ScanDone {
                     status,
@@ -782,8 +871,50 @@ fn esp_api_adapter_init() -> Result<(), NetError> {
                         channel, authmode, aid
                     );
                 }
-                EventInfo::StationDisconnected { reason, .. } => {
-                    log::info!("WiFi StationDisconnected: reason={}", reason);
+                EventInfo::StationDisconnected {
+                    ssid,
+                    bssid,
+                    reason,
+                    rssi,
+                } => {
+                    log::warn!(
+                        "WiFi StationDisconnected: ssid={:?} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} reason={} rssi={} dBm",
+                        ssid,
+                        bssid[0],
+                        bssid[1],
+                        bssid[2],
+                        bssid[3],
+                        bssid[4],
+                        bssid[5],
+                        reason,
+                        rssi,
+                    );
+                }
+                EventInfo::StationBasicServiceSetReceivedSignalStrengthIndicatorLow {
+                    rssi,
+                } => log::warn!("WiFi BSS RSSI low: rssi={} dBm", rssi),
+                EventInfo::StationBeaconTimeout => {
+                    log::warn!("WiFi StationBeaconTimeout");
+                }
+                EventInfo::StationAuthenticationModeChange { old_mode, new_mode } => {
+                    log::warn!(
+                        "WiFi authentication mode changed: old_mode={} new_mode={}",
+                        old_mode, new_mode
+                    );
+                }
+                EventInfo::HomeChannelChange {
+                    old_chan,
+                    old_snd,
+                    new_chan,
+                    new_snd,
+                } => {
+                    log::warn!(
+                        "WiFi home channel changed: old_chan={} old_snd={} new_chan={} new_snd={}",
+                        old_chan,
+                        old_snd,
+                        new_chan,
+                        new_snd,
+                    );
                 }
                 _ => log::debug!("WiFi event: {:?}", event),
             }
@@ -926,6 +1057,15 @@ pub(crate) static __ESP_RADIO_G_WIFI_OSI_FUNCS: wifi_osi_funcs_t = wifi_osi_func
     _coex_schm_flexible_period_get: Some(coex_schm_flexible_period_get),
     _coex_schm_get_phase_by_idx: Some(coex_schm_get_phase_by_idx),
 
+    // C6's wifi_osi_funcs_t has two extra sleep retention fields vs C3 (see
+    // esp-wifi-sys-esp32c6 include.rs:11401-11406); the C3 crate lacks them, hence
+    // cfg-gated. BlueOS does not implement sleep retention yet, so fill None
+    // (libnet80211 detects None and skips that path).
+    #[cfg(soc_esp32c6)]
+    _regdma_link_set_write_wait_content: None,
+    #[cfg(soc_esp32c6)]
+    _sleep_retention_find_link_by_id: None,
+
     _magic: ESP_WIFI_OS_ADAPTER_MAGIC as i32,
 };
 
@@ -941,14 +1081,12 @@ fn esp_wifi_init() -> Result<(), NetError> {
             wpa_crypto_funcs: g_wifi_default_wpa_crypto_funcs,
             static_rx_buf_num: 10,
             dynamic_rx_buf_num: 32,
-            tx_buf_type: esp_wifi_sys_esp32c3::include::CONFIG_ESP_WIFI_TX_BUFFER_TYPE as i32,
+            tx_buf_type: esp_wifi_sys::include::CONFIG_ESP_WIFI_TX_BUFFER_TYPE as i32,
             static_tx_buf_num: 0,
             dynamic_tx_buf_num: 32,
-            rx_mgmt_buf_type: esp_wifi_sys_esp32c3::include::CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUF
-                as i32,
-            rx_mgmt_buf_num: esp_wifi_sys_esp32c3::include::CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF
-                as i32,
-            cache_tx_buf_num: esp_wifi_sys_esp32c3::include::WIFI_CACHE_TX_BUFFER_NUM as i32,
+            rx_mgmt_buf_type: esp_wifi_sys::include::CONFIG_ESP_WIFI_DYNAMIC_RX_MGMT_BUF as i32,
+            rx_mgmt_buf_num: esp_wifi_sys::include::CONFIG_ESP_WIFI_RX_MGMT_BUF_NUM_DEF as i32,
+            cache_tx_buf_num: esp_wifi_sys::include::WIFI_CACHE_TX_BUFFER_NUM as i32,
             csi_enable: true as i32,
             ampdu_rx_enable: true as i32,
             ampdu_tx_enable: true as i32,
@@ -957,12 +1095,12 @@ fn esp_wifi_init() -> Result<(), NetError> {
             nano_enable: 0,
             rx_ba_win: 6,
             wifi_task_core_id: 0,
-            beacon_max_len: esp_wifi_sys_esp32c3::include::WIFI_SOFTAP_BEACON_MAX_LEN as i32,
-            mgmt_sbuf_num: esp_wifi_sys_esp32c3::include::WIFI_MGMT_SBUF_NUM as i32,
+            beacon_max_len: esp_wifi_sys::include::WIFI_SOFTAP_BEACON_MAX_LEN as i32,
+            mgmt_sbuf_num: esp_wifi_sys::include::WIFI_MGMT_SBUF_NUM as i32,
             feature_caps: __ESP_RADIO_G_WIFI_FEATURE_CAPS,
             sta_disconnected_pm: false,
-            espnow_max_encrypt_num:
-                esp_wifi_sys_esp32c3::include::CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM as i32,
+            espnow_max_encrypt_num: esp_wifi_sys::include::CONFIG_ESP_WIFI_ESPNOW_MAX_ENCRYPT_NUM
+                as i32,
 
             tx_hetb_queue_num: 3,
             dump_hesigb_enable: false,
@@ -993,3 +1131,34 @@ const WIFI_FEATURE_CAPS: u64 = WIFI_ENABLE_WPA3_SAE | WIFI_ENABLE_ENTERPRISE;
 
 #[unsafe(no_mangle)]
 pub(super) static mut __ESP_RADIO_G_WIFI_FEATURE_CAPS: u64 = WIFI_FEATURE_CAPS;
+
+/* ---- NVS / log_level symbols required by the closed-source libnet80211 .a ----
+ * Background: the C3 link.x aliases g_misc_nvs / g_log_level (needed by the .a)
+ * to __ESP_RADIO_G_MISC_NVS / __ESP_RADIO_G_LOG_LEVEL provided by esp-radio-0.18.0
+ * (see esp-radio-0.18.0 common_adapter.rs:276-281). But the C6 build links
+ * esp-phy-0.2.0 + esp-radio-rtos-driver-0.3.0 and never compiles esp-radio-0.18.0
+ * (0 references in build.ninja), so these two symbols have no definition source on
+ * the C6 path.
+ *   libnet80211.a both references (U) and self-defines (B) g_misc_nvs / g_log_level:
+ * as long as misc_nvs.o is kept by --gc-sections, the B definition suffices; once
+ * misc_nvs.o is dropped, g_misc_nvs degenerates into a pure undefined reference,
+ * link.x's PROVIDE(g_misc_nvs = __ESP_RADIO_G_MISC_NVS) activates, and at that point
+ * __ESP_RADIO_G_MISC_NVS must have a definition, otherwise the link errors with
+ * "undefined symbol __ESP_RADIO_G_MISC_NVS referenced in expression".
+ *   Fix: provide both symbols here in BlueOS's self-implemented OSI module (semantics
+ * copied verbatim from esp-radio-0.18.0); same crate / same .o as
+ * __ESP_RADIO_G_WIFI_OSI_FUNCS, so it is always kept along with esp32_wlan.
+ * NVS is a 15×u32 array (the default slot count in esp-idf misc_nvs.c),
+ * log_level=0 (no logging).
+ */
+/// The NVS storage pointed to by libnet80211 `g_misc_nvs` (15 u32 slots, esp-idf default size).
+#[used]
+static mut NVS: [u32; 15] = [0u32; 15];
+
+/// The real definition of libnet80211 `g_misc_nvs`; link.x aliases g_misc_nvs -> this symbol.
+#[unsafe(no_mangle)]
+pub(super) static mut __ESP_RADIO_G_MISC_NVS: *mut u32 = unsafe { &raw mut NVS } as *mut u32;
+
+/// The real definition of libnet80211 `g_log_level` (0 = logging off); link.x aliases g_log_level -> this symbol.
+#[unsafe(no_mangle)]
+pub(super) static mut __ESP_RADIO_G_LOG_LEVEL: i32 = 0;
