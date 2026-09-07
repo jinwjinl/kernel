@@ -17,12 +17,12 @@ use crate::{
 };
 use alloc::boxed::Box;
 use blueos_driver::interrupt_controller::Interrupt;
-use esp_hal::ram;
 use core::{
     ffi::CStr,
     ptr::NonNull,
     sync::atomic::{AtomicPtr, AtomicU32, Ordering},
 };
+use esp_hal::ram;
 use esp_radio_rtos_driver::{
     queue::{QueueHandle, QueuePtr},
     semaphore::{SemaphoreHandle, SemaphoreKind, SemaphorePtr},
@@ -168,9 +168,8 @@ pub static ISR_INTERRUPT_1: Handler = Handler::new();
 pub fn dispatch_handler(handler: &Handler) {
     let f = handler.f.load(Ordering::Acquire);
     if !f.is_null() {
-        let func = unsafe {
-            core::mem::transmute::<*const c_void, unsafe extern "C" fn(*mut c_void)>(f)
-        };
+        let func =
+            unsafe { core::mem::transmute::<*const c_void, unsafe extern "C" fn(*mut c_void)>(f) };
         let arg = handler.arg.load(Ordering::Relaxed);
         unsafe { func(arg) };
     }
@@ -331,13 +330,6 @@ pub unsafe extern "C" fn ints_on(mask: u32) {
     // mask = 1 << cpu_intr_num; WiFi expects mask=0x2 (line1); if not 0x2, the driver
     // routed WiFi to a line other than line1, which does not match set_isr's
     // ISR_INTERRUPT_1 (line1) → never reaches the trap.
-    // let mie_before: usize;
-    // core::arch::asm!(
-    //     "csrr {mie}, mie",
-    //     mie = out(reg) mie_before,
-    //     options(nostack, preserves_flags),
-    // );
-    // log::info!("[diag] ints_on(mask=0x{mask:x}) mie_before=0x{mie_before:x}");
     let tmp = core::ptr::read_volatile(INT_ENABLE_REG as *const u32);
     core::ptr::write_volatile(INT_ENABLE_REG as *mut u32, tmp | mask);
 }

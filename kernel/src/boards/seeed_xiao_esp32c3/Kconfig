@@ -84,3 +84,7 @@ config SOC_ESP32C3
 
 config NUM_IRQS
     default 31
+
+config ESP32_INTERNAL_FLASH
+    bool "Enable ESP32 internal flash"
+    default n

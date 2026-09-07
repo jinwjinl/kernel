@@ -524,8 +524,14 @@ impl Connection {
     }
 
     pub fn handle_socket_msg(network_manager: Rc<RefCell<NetworkManager>>) -> bool {
-        // one msg at a time , TODO batch
-        if let Some(socket_request) = NETSTACK_QUEUE.dequeue() {
+        // Drain the whole queue before yielding back to the poll loop. The
+        // upstream baseline uses `if` (one op per poll+sleep round) which
+        // roughly halves OTA recv throughput because every op pays a 10ms
+        // `suspend_me_for` in `loop_within_single_thread`. Draining here
+        // batches app-side socket requests so a single poll+yield serves
+        // all of them. The `is_cancelled()` discard (PR #464) still works:
+        // a cancelled op returns early and the next call drains the rest.
+        while let Some(socket_request) = NETSTACK_QUEUE.dequeue() {
             if socket_request.is_cancelled() {
                 log::debug!("Discarding cancelled socket operation");
                 return true;

@@ -12,27 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! ESP32-C3 Flash MMU mapping (XIP) for the Loadable Region.
+//! ESP32-C6 Flash MMU mapping (XIP) for the Loadable Region.
 //!
 //! The 2nd-stage bootloader maps only the kernel's own IROM/DROM segments; the
 //! Loadable Region (paddr 0x110000+) is NOT pre-mapped. `map_exec` programs the
 //! MMU table entry for each 64 KB page, then invalidates ICache + `fence.i`;
 //! `unmap_exec` invalidates the entries.
 //!
-//! The C3 is ICache-only with a single shared MMU table: IROM and DROM vaddrs
-//! at the same offset resolve to one entry (`(vaddr & 0x7FFFFF) >> 16`).
-//! `map_exec` therefore calls both `Cache_Ibus_MMU_Set` and `Cache_Dbus_MMU_Set`
-//! so the image is reachable as code (I-bus) and data (D-bus); both land on the
-//! same entry, so `unmap_exec` writes it once to clear both views.
-//!
-//! `map_drom` adds an independent D-bus mapping for a .rodata PT_LOAD whose
-//! vaddr lies in the DROM window — distinct physical base + distinct DROM
-//! vaddr, sharing the table but on non-overlapping entries. Must follow
-//! `map_exec`; `unmap_drom` clears the DROM entries. No entry-conflict check:
-//! the loader guarantees the DROM vaddr's entries do not collide with the
-//! live I-bus mapping.
+//! C6 uses one shared I-D MMU table; executable and read-only data use the same window.
+//! map_exec installs the mapping and map_drom is retained only as an explicit
+//! unsupported compatibility entry point.
 
-use super::esp32_rom;
+#[cfg(soc_esp32c6)]
+use super::esp32c6_rom as esp32_rom;
 use crate::{
     boards::{
         DROM_VADDR_BASE, DROM_VADDR_END, IROM_VADDR_BASE, LOADABLE_REGION_BASE,
@@ -52,6 +44,7 @@ pub enum MapError {
     InvalidHandle,
     DromNotAfterExec,
     DromAlreadyMapped,
+    Unsupported,
 }
 
 /// Executable mapping handle. `segment_address` is the entry the Loader jumps
@@ -171,27 +164,7 @@ pub fn map_exec(physical_offset: u32, size: usize) -> Result<ExecMapping, MapErr
             state.busy = false;
             return Err(MapError::OutOfRange);
         }
-        // Wire up the D-bus (DROM) view too — see module doc on the shared table.
-        let drom_vaddr = DROM_VADDR_BASE.wrapping_add(page_base);
-        let rc_d = unsafe { esp32_rom::rom_mmu_map_d(drom_vaddr, page_base, num_pages) };
-        if rc_d != 0 {
-            let mut v = mapped_page_address;
-            for _ in 0..num_pages {
-                let entry_id = (v & 0x7F_FFFF) >> 16;
-                unsafe { esp32_rom::rom_mmu_unmap(entry_id) };
-                v += FLASH_MMU_PAGE_SIZE;
-            }
-            unsafe {
-                esp32_rom::rom_invalidate_icache_all();
-            }
-            instruction_fence();
-            let mut state = MMAP_STATE.irqsave_lock();
-            state.irom_handle = None;
-            state.busy = false;
-            return Err(MapError::OutOfRange);
-        }
     }
-
     unsafe {
         esp32_rom::rom_invalidate_icache_all();
     }
@@ -252,85 +225,11 @@ pub fn unmap_exec(mapping: &ExecMapping) -> Result<(), MapError> {
 /// ensure the DROM vaddr's MMU entries do not collide with the live I-bus
 /// mapping). Requires map_exec to have run first (DromNotAfterExec otherwise).
 pub fn map_drom(
-    physical_offset: u32,
-    size: usize,
-    drom_vaddr: u32,
+    _physical_offset: u32,
+    _size: usize,
+    _drom_vaddr: u32,
 ) -> Result<DromMapping, MapError> {
-    if size == 0 {
-        return Err(MapError::ZeroSize);
-    }
-    let size_u32 = u32::try_from(size).map_err(|_| MapError::Overflow)?;
-    let physical_end = physical_offset
-        .checked_add(size_u32)
-        .ok_or(MapError::Overflow)?;
-    check_loadable_range(physical_offset, physical_end)?;
-
-    if drom_vaddr < DROM_VADDR_BASE || drom_vaddr >= DROM_VADDR_END {
-        return Err(MapError::OutOfRange);
-    }
-    let drom_end = drom_vaddr.checked_add(size_u32).ok_or(MapError::Overflow)?;
-    if drom_end > DROM_VADDR_END {
-        return Err(MapError::OutOfRange);
-    }
-
-    let page_base = physical_offset & !(FLASH_MMU_PAGE_SIZE - 1);
-    let page_offset = (physical_offset - page_base) as usize;
-    let required_size = page_offset.checked_add(size).ok_or(MapError::Overflow)?;
-    let mapped_size =
-        align_up(required_size, FLASH_MMU_PAGE_SIZE as usize).ok_or(MapError::Overflow)?;
-    let mapped_page_vaddr = drom_vaddr & !(FLASH_MMU_PAGE_SIZE - 1);
-
-    // Hardware constrains vaddr%PAGE == paddr%PAGE; loader lays .rodata at a
-    // 64K-aligned physical offset whose low 16 bits match drom_vaddr's.
-    if (mapped_page_vaddr % FLASH_MMU_PAGE_SIZE) != (page_base % FLASH_MMU_PAGE_SIZE) {
-        return Err(MapError::OutOfRange);
-    }
-
-    let handle = {
-        let mut state = MMAP_STATE.irqsave_lock();
-        if state.busy {
-            return Err(MapError::AlreadyMapped);
-        }
-        if state.irom_handle.is_none() {
-            return Err(MapError::DromNotAfterExec);
-        }
-        if state.drom_handle.is_some() {
-            return Err(MapError::DromAlreadyMapped);
-        }
-        let handle = state.next_handle;
-        state.next_handle = state.next_handle.wrapping_add(1);
-        state.drom_handle = Some(handle);
-        state.busy = true;
-        handle
-    };
-
-    #[cfg(not(test))]
-    {
-        let num_pages = (mapped_size / FLASH_MMU_PAGE_SIZE as usize) as u32;
-        let rc = unsafe { esp32_rom::rom_mmu_map_d(mapped_page_vaddr, page_base, num_pages) };
-        if rc != 0 {
-            let mut state = MMAP_STATE.irqsave_lock();
-            state.drom_handle = None;
-            state.busy = false;
-            return Err(MapError::OutOfRange);
-        }
-    }
-
-    unsafe {
-        esp32_rom::rom_invalidate_icache_all();
-    }
-    instruction_fence();
-
-    {
-        let mut state = MMAP_STATE.irqsave_lock();
-        state.busy = false;
-    }
-    Ok(DromMapping {
-        drom_vaddr: mapped_page_vaddr as usize,
-        mapped_size,
-        physical_page_base: page_base,
-        handle,
-    })
+    Err(MapError::Unsupported)
 }
 
 /// Release the D-bus (DROM) mapping. Caller must not read from the range after.
@@ -439,7 +338,7 @@ mod tests {
 
     #[test]
     fn physical_flash_offset_maps_to_expected_irom_address() {
-        assert_eq!(physical_to_irom_vaddr(0x0011_0000), Ok(0x4211_0000));
+        assert_eq!(physical_to_irom_vaddr(0x0020_0000), Ok(0x4220_0000));
     }
 
     #[test]

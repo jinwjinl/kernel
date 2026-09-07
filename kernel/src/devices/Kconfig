@@ -89,3 +89,29 @@ config SPI_FLASH_CHIP_ERASE_TIMEOUT_MS
     default 200000
     range 1 600000
     depends on ENABLE_BLOCK
+
+config ESP32_FLASH_SECTOR_SIZE
+    int "ESP32 internal flash sector size"
+    default 4096
+
+config ESP32_FLASH_PAGE_SIZE
+    int "ESP32 internal flash page size"
+    default 256
+
+config ESP32_FLASH_BLOCK_64K_SIZE
+    int "ESP32 internal flash 64 KiB block size"
+    default 65536
+
+config ESP32_FLASH_READ_CHUNK_SIZE
+    int "ESP32 internal flash read chunk size"
+    default 1024
+
+config ESP32_LOADABLE_REGION_BASE
+    hex "Loadable flash region base"
+    default 0x00110000 if SOC_ESP32C3
+    default 0x00200000 if SOC_ESP32C6
+
+config ESP32_LOADABLE_REGION_SIZE
+    hex "Loadable flash region size"
+    default 0x002F0000 if SOC_ESP32C3
+    default 0x00300000 if SOC_ESP32C6

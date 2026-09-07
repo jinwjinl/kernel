@@ -537,9 +537,7 @@ impl Device for Esp32WlanLink {
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut caps = smoltcp::phy::DeviceCapabilities::default();
         caps.max_transmission_unit = self.mtu();
-        // Keep egress bursts bounded so the Wi-Fi task gets regular scheduling
-        // opportunities to service beacon reception.
-        caps.max_burst_size = Some(1);
+        caps.max_burst_size = Some(8);
         caps.medium = SmoltcpMedium::Ethernet;
         caps
     }
@@ -890,16 +888,17 @@ fn esp_api_adapter_init() -> Result<(), NetError> {
                         rssi,
                     );
                 }
-                EventInfo::StationBasicServiceSetReceivedSignalStrengthIndicatorLow {
-                    rssi,
-                } => log::warn!("WiFi BSS RSSI low: rssi={} dBm", rssi),
+                EventInfo::StationBasicServiceSetReceivedSignalStrengthIndicatorLow { rssi } => {
+                    log::warn!("WiFi BSS RSSI low: rssi={} dBm", rssi)
+                }
                 EventInfo::StationBeaconTimeout => {
                     log::warn!("WiFi StationBeaconTimeout");
                 }
                 EventInfo::StationAuthenticationModeChange { old_mode, new_mode } => {
                     log::warn!(
                         "WiFi authentication mode changed: old_mode={} new_mode={}",
-                        old_mode, new_mode
+                        old_mode,
+                        new_mode
                     );
                 }
                 EventInfo::HomeChannelChange {
